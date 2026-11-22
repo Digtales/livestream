@@ -12,7 +12,13 @@ import com.pedro.library.rtmp.RtmpDisplay
 
 class StreamService : Service(), ConnectChecker {
     companion object {
+        const val STATUS_ACTION = "com.livecast.STATUS"
         var running = false
+        var previewEnabled = true
+        var streamConnected = false
+        var chatConnected = false
+        var streamStatus = "Disconnected"
+        var platform = ""
         var rtmpUrl = ""; var tickerText = ""; var chatSource = ""; var chatTarget = ""; var chatToken = ""
         var landscape = false; var micOn = true
     }
@@ -30,12 +36,16 @@ class StreamService : Service(), ConnectChecker {
         when (i?.action) {
             "START" -> start(i)
             "MIC" -> if (micOn) display?.enableAudio() else display?.disableAudio()
+            "PREVIEW" -> Unit
             "STOP" -> stop()
         }
         return START_NOT_STICKY
     }
 
     private fun start(i: Intent) {
+        streamConnected = false
+        streamStatus = "Connecting"
+        broadcastStatus()
         val ch = "live"
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(ch, "Live", NotificationManager.IMPORTANCE_LOW))
@@ -66,7 +76,13 @@ class StreamService : Service(), ConnectChecker {
         if (chatSource.isNotEmpty() && chatTarget.isNotEmpty()) {
             poller = ChatPoller(chatSource, chatTarget, chatToken) { line ->
                 synchronized(chat) { chat.add(line); while (chat.size > 6) chat.removeAt(0) }
-            }.also { it.start() }
+            }.also {
+                it.onStatus = { connected ->
+                    chatConnected = connected
+                    broadcastStatus()
+                }
+                it.start()
+            }
         }
         handler.post(draw(w / 2, h / 2))
     }
@@ -103,15 +119,36 @@ class StreamService : Service(), ConnectChecker {
 
     private fun stop() {
         running = false
+        streamConnected = false
+        chatConnected = false
+        streamStatus = "Disconnected"
+        broadcastStatus()
         handler.removeCallbacksAndMessages(null)
         poller?.stopPolling()
         display?.apply { if (isStreaming) stopStream() }
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
     }
 
-    override fun onConnectionStarted(url: String) {}
-    override fun onConnectionSuccess() {}
-    override fun onConnectionFailed(reason: String) { stop() }
+    private fun broadcastStatus() {
+        sendBroadcast(Intent(STATUS_ACTION))
+    }
+
+    override fun onConnectionStarted(url: String) {
+        streamConnected = false
+        streamStatus = "Connecting"
+        broadcastStatus()
+    }
+    override fun onConnectionSuccess() {
+        streamConnected = true
+        streamStatus = if (platform == "yt") "YouTube Live connected" else "Live connected"
+        broadcastStatus()
+    }
+    override fun onConnectionFailed(reason: String) {
+        streamConnected = false
+        streamStatus = "Connection failed"
+        broadcastStatus()
+        stop()
+    }
     override fun onNewBitrate(bitrate: Long) {}
     override fun onDisconnect() {}
     override fun onAuthError() {}

@@ -10,6 +10,7 @@ class ChatPoller(
     private val onLine: (String) -> Unit
 ) : Thread() {
     @Volatile private var go = true
+    var onStatus: (Boolean) -> Unit = {}
     private val seen = HashSet<String>()
     fun stopPolling() { go = false }
 
@@ -22,7 +23,14 @@ class ChatPoller(
                     "https://graph.facebook.com/v19.0/$id/comments?fields=from,message&access_token=$token"
                 val c = URL(u).openConnection() as HttpURLConnection
                 if (src == "yt") c.setRequestProperty("Authorization", "Bearer $token")
+                val code = c.responseCode
+                if (code !in 200..299) {
+                    onStatus(false)
+                    try { sleep(5000) } catch (_: InterruptedException) {}
+                    continue
+                }
                 val j = JSONObject(c.inputStream.bufferedReader().readText())
+                onStatus(true)
                 if (src == "yt") {
                     val a = j.getJSONArray("items")
                     for (k in 0 until a.length()) {
@@ -39,7 +47,9 @@ class ChatPoller(
                             onLine(o.optJSONObject("from")?.optString("name", "User") + ": " + o.optString("message"))
                     }
                 }
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                onStatus(false)
+            }
             try { sleep(5000) } catch (_: InterruptedException) {}
         }
     }
