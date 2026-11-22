@@ -64,6 +64,7 @@ class MainActivity : Activity() {
     private var pendingMode = "stream"
     private var streamService: StreamService? = null
     private var serviceBound = false
+    private var suppressPreviewChange = false
     private var previewSurface: Surface? = null
     private var previewWidth = 0
     private var previewHeight = 0
@@ -189,17 +190,17 @@ class MainActivity : Activity() {
 
         root.addView(label("Destination"))
         url = et("RTMP server URL (e.g. rtmp://a.rtmp.youtube.com/live2)")
-        streamKey = et("Stream key (optional if already included in URL)")
+        streamKey = et("YouTube stream key (actual secret value)")
         streamKey.inputType = android.text.InputType.TYPE_CLASS_TEXT or
             android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
         root.addView(TextView(this).apply {
-            text = "For YouTube, copy your private stream key from YouTube Studio > Live Control Room > Stream settings. Keep it secret."
+            text = "In YouTube Studio > Live Control Room > Stream settings, copy the key value. A custom key name (for example, TradeLive) is only a label, not the key."
             setTextColor(Color.parseColor("#AAB3C2"))
             textSize = 12f
             setPadding(0, dp(4), 0, dp(8))
         })
         connectBtn = Button(this).apply {
-            text = "CONNECT"
+            text = "CHECK SERVER"
             setAllCaps(false)
             root.addView(this)
         }
@@ -331,6 +332,7 @@ class MainActivity : Activity() {
         }
         preview.setOnCheckedChangeListener { _, on ->
             StreamService.previewEnabled = on
+            if (suppressPreviewChange) return@setOnCheckedChangeListener
             if (on) {
                 saveSettings()
                 if (StreamService.running) {
@@ -353,7 +355,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             root.addView(this)
         }
-        btn = actionButton("STREAM", "#E11D48").also { actionRow.addView(it, weightedButtonParams()) }
+        btn = actionButton("GO LIVE", "#E11D48").also { actionRow.addView(it, weightedButtonParams()) }
         recordBtn = actionButton("RECORD", "#2563EB").also { actionRow.addView(it, weightedButtonParams()) }
         recordingStatus = statusText(StreamService.recordStatus)
         recordingStatus.setPadding(0, dp(6), 0, dp(6))
@@ -362,32 +364,38 @@ class MainActivity : Activity() {
             saveSettings()
             if (StreamService.streamConnected || StreamService.streamStatus == "Connecting") {
                 startService(Intent(this, StreamService::class.java).setAction("STOP_STREAM"))
-            } else if (StreamService.previewOnly) {
-                startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
-                if (!validRtmpUrl()) return@setOnClickListener
-                pendingMode = "stream"
-                askPermissions()
-            } else if (!StreamService.running) {
-                if (!validRtmpUrl()) return@setOnClickListener
-                pendingMode = "stream"
-                askPermissions()
             } else {
-                startService(Intent(this, StreamService::class.java).setAction("STREAM"))
+                enablePreviewForCapture()
+                if (StreamService.previewOnly) {
+                    startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
+                    if (!validRtmpUrl()) return@setOnClickListener
+                    pendingMode = "stream"
+                    askPermissions()
+                } else if (!StreamService.running) {
+                    if (!validRtmpUrl()) return@setOnClickListener
+                    pendingMode = "stream"
+                    askPermissions()
+                } else {
+                    startService(Intent(this, StreamService::class.java).setAction("STREAM"))
+                }
             }
         }
         recordBtn.setOnClickListener {
             saveSettings()
             if (StreamService.recording) {
                 startService(Intent(this, StreamService::class.java).setAction("RECORD"))
-            } else if (StreamService.previewOnly) {
-                startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
-                pendingMode = "record"
-                askPermissions()
-            } else if (!StreamService.running) {
-                pendingMode = "record"
-                askPermissions()
             } else {
-                startService(Intent(this, StreamService::class.java).setAction("RECORD"))
+                enablePreviewForCapture()
+                if (StreamService.previewOnly) {
+                    startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
+                    pendingMode = "record"
+                    askPermissions()
+                } else if (!StreamService.running) {
+                    pendingMode = "record"
+                    askPermissions()
+                } else {
+                    startService(Intent(this, StreamService::class.java).setAction("RECORD"))
+                }
             }
         }
         val openRecordingButton = actionButton("OPEN LAST RECORDING", "#334155")
@@ -447,6 +455,15 @@ class MainActivity : Activity() {
         1f
     ).apply { marginEnd = dp(6) }
 
+    private fun enablePreviewForCapture() {
+        if (preview.isChecked) return
+        suppressPreviewChange = true
+        preview.isChecked = true
+        suppressPreviewChange = false
+        StreamService.previewEnabled = true
+        if (StreamService.running) attachPreview()
+    }
+
     private fun validRtmpUrl(): Boolean {
         val value = effectiveRtmpUrl()
         val uri = Uri.parse(value)
@@ -458,6 +475,7 @@ class MainActivity : Activity() {
             url.error = "Use an RTMP(S) server URL with app name and stream key"
             return false
         }
+        url.error = null
         return true
     }
 
@@ -486,7 +504,11 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 connectBtn.isEnabled = true
-                destinationStatus.text = result
+                destinationStatus.text = if (result.startsWith("RTMP server reachable")) {
+                    "TCP reachable only; tap STREAM to publish. This does not verify your stream key."
+                } else {
+                    result
+                }
                 val reachable = result.startsWith("RTMP server reachable")
                 destinationStatus.setTextColor(if (reachable) Color.GREEN else Color.RED)
                 setDot(destinationDot, if (reachable) Color.GREEN else Color.RED)
@@ -600,7 +622,7 @@ class MainActivity : Activity() {
         btn.text = when {
             StreamService.streamConnected -> "STOP STREAM"
             StreamService.streamStatus == "Connecting" -> "CANCEL STREAM"
-            else -> "STREAM"
+            else -> "GO LIVE"
         }
         recordBtn.text = if (StreamService.recording) "STOP RECORDING" else "RECORD"
         recordingStatus.text = StreamService.recordStatus
