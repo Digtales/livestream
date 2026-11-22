@@ -27,6 +27,7 @@ import java.net.Socket
 
 class MainActivity : Activity() {
     private lateinit var url: EditText
+    private lateinit var streamKey: EditText
     private lateinit var ticker: EditText
     private lateinit var chatId: EditText
     private lateinit var token: EditText
@@ -36,6 +37,7 @@ class MainActivity : Activity() {
     private lateinit var preview: Switch
     private lateinit var btn: Button
     private lateinit var recordBtn: Button
+    private lateinit var recordingStatus: TextView
     private lateinit var connectBtn: Button
     private lateinit var destinationStatus: TextView
     private lateinit var destinationDot: View
@@ -156,7 +158,10 @@ class MainActivity : Activity() {
         }
 
         root.addView(label("Destination"))
-        url = et("RTMP URL + stream key")
+        url = et("RTMP server URL (e.g. rtmp://a.rtmp.youtube.com/live2)")
+        streamKey = et("Stream key (optional if already included in URL)")
+        streamKey.inputType = android.text.InputType.TYPE_CLASS_TEXT or
+            android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
         connectBtn = Button(this).apply {
             text = "CONNECT"
             setAllCaps(false)
@@ -278,6 +283,9 @@ class MainActivity : Activity() {
         }
         btn = actionButton("STREAM", "#E11D48").also { actionRow.addView(it, weightedButtonParams()) }
         recordBtn = actionButton("RECORD", "#2563EB").also { actionRow.addView(it, weightedButtonParams()) }
+        recordingStatus = statusText(StreamService.recordStatus)
+        recordingStatus.setPadding(0, dp(6), 0, dp(6))
+        root.addView(recordingStatus)
         btn.setOnClickListener {
             saveSettings()
             if (StreamService.streamConnected || StreamService.streamStatus == "Connecting") {
@@ -355,18 +363,28 @@ class MainActivity : Activity() {
     ).apply { marginEnd = dp(6) }
 
     private fun validRtmpUrl(): Boolean {
-        val value = url.text.toString().trim()
+        val value = effectiveRtmpUrl()
         val uri = Uri.parse(value)
-        if (!listOf("rtmp", "rtmps").any { it.equals(uri.scheme, ignoreCase = true) } || uri.host.isNullOrBlank()) {
-            url.error = "Enter a valid rtmp:// or rtmps:// server URL and stream key"
+        val pathSegments = uri.pathSegments.filter { it.isNotBlank() }
+        if (!listOf("rtmp", "rtmps").any { it.equals(uri.scheme, ignoreCase = true) } ||
+            uri.host.isNullOrBlank() ||
+            pathSegments.size < 2
+        ) {
+            url.error = "Use an RTMP(S) server URL with app name and stream key"
             return false
         }
         return true
     }
 
+    private fun effectiveRtmpUrl(): String {
+        val serverUrl = url.text.toString().trim().trimEnd('/')
+        val key = streamKey.text.toString().trim().trim('/')
+        return if (key.isEmpty()) serverUrl else "$serverUrl/$key"
+    }
+
     private fun checkDestination() {
         if (!validRtmpUrl()) return
-        val uri = Uri.parse(url.text.toString().trim())
+        val uri = Uri.parse(effectiveRtmpUrl())
         val port = if (uri.port > 0) uri.port else if (uri.scheme.equals("rtmps", ignoreCase = true)) 443 else 1935
         val host = uri.host ?: return
         connectBtn.isEnabled = false
@@ -398,7 +416,7 @@ class MainActivity : Activity() {
                 2 -> "fb"
                 else -> "rtmp"
             }
-            rtmpUrl = this@MainActivity.url.text.toString().trim()
+            rtmpUrl = this@MainActivity.effectiveRtmpUrl()
             tickerText = this@MainActivity.ticker.text.toString()
             chatSource = when (this@MainActivity.platform.checkedRadioButtonId) {
                 1 -> "yt"
@@ -438,6 +456,7 @@ class MainActivity : Activity() {
             else -> "STREAM"
         }
         recordBtn.text = if (StreamService.recording) "STOP RECORDING" else "RECORD"
+        recordingStatus.text = StreamService.recordStatus
         val chatEnabled = chatId.text.toString().trim().isNotEmpty() &&
             platform.checkedRadioButtonId != 3
         setDot(chatDot, if (StreamService.chatConnected) Color.GREEN else if (chatEnabled) Color.RED else Color.GRAY)

@@ -24,8 +24,11 @@ class StreamService : Service(), ConnectChecker {
         const val STATUS_ACTION = "com.livecast.STATUS"
         var running = false
         var previewEnabled = true
+        var streamRequested = false
         var streamConnected = false
         var recording = false
+        var recordStatus = "Not recording"
+        var recordingPath = ""
         var chatConnected = false
         var streamStatus = "Disconnected"
         var platform = ""
@@ -59,9 +62,21 @@ class StreamService : Service(), ConnectChecker {
                 "STOP" -> stop()
             }
         } catch (e: java.io.IOException) {
-            stop("Error: ${e.message ?: "could not access recording storage"}")
+            val message = e.message ?: "could not access recording storage"
+            if (i?.action == "RECORD" || i?.getStringExtra("mode") == "record") {
+                recordStatus = "Recording failed: $message"
+                stop()
+            } else {
+                stop("Error: $message")
+            }
         } catch (e: RuntimeException) {
-            stop("Error: ${e.message ?: "could not start capture"}")
+            val message = e.message ?: "could not start capture"
+            if (i?.action == "RECORD" || i?.getStringExtra("mode") == "record") {
+                recordStatus = "Recording failed: $message"
+                stop()
+            } else {
+                stop("Error: $message")
+            }
         }
         return START_NOT_STICKY
     }
@@ -146,6 +161,7 @@ class StreamService : Service(), ConnectChecker {
     private fun startStream() {
         val d = display ?: return
         if (d.isStreaming) return
+        streamRequested = true
         streamStatus = "Connecting"
         streamConnected = false
         broadcastStatus()
@@ -154,6 +170,7 @@ class StreamService : Service(), ConnectChecker {
 
     private fun stopStream() {
         val d = display
+        streamRequested = false
         if (d?.isStreaming == true) d.stopStream()
         streamConnected = false
         streamStatus = "Disconnected"
@@ -166,6 +183,7 @@ class StreamService : Service(), ConnectChecker {
         if (d.isRecording) {
             d.stopRecord()
             recording = false
+            recordStatus = "Saved in Android/data/com.livecast/files/Movies: ${File(recordingPath).name}"
             broadcastStatus()
             if (!d.isStreaming) stop()
             return
@@ -176,15 +194,32 @@ class StreamService : Service(), ConnectChecker {
             throw IllegalStateException("Could not create video storage directory")
         }
         val file = File(directory, "LiveCast_${System.currentTimeMillis()}.mp4")
-        d.startRecord(file.absolutePath) { status ->
-            when (status) {
-                RecordController.Status.RECORDING, RecordController.Status.RESUMED -> recording = true
-                RecordController.Status.STOPPED -> recording = false
-                else -> Unit
+        recordingPath = file.absolutePath
+        recordStatus = "Starting recording..."
+        d.startRecord(file.absolutePath, object : RecordController.Listener {
+            override fun onStatusChange(status: RecordController.Status) {
+                when (status) {
+                    RecordController.Status.RECORDING, RecordController.Status.RESUMED -> {
+                        recording = true
+                        recordStatus = "Recording: ${file.name}"
+                    }
+                    RecordController.Status.STOPPED -> {
+                        recording = false
+                        recordStatus = "Saved in Android/data/com.livecast/files/Movies: ${file.name}"
+                    }
+                    else -> Unit
+                }
+                broadcastStatus()
             }
-            broadcastStatus()
-        }
+
+            override fun onError(e: Exception) {
+                recording = false
+                recordStatus = "Recording failed: ${e.message ?: "write error"}"
+                broadcastStatus()
+            }
+        })
         recording = true
+        recordStatus = "Recording: ${file.name}"
         broadcastStatus()
     }
 
@@ -237,6 +272,7 @@ class StreamService : Service(), ConnectChecker {
 
     private fun stop(errorStatus: String? = null) {
         running = false
+        streamRequested = false
         streamConnected = false
         recording = false
         chatConnected = false
@@ -257,24 +293,35 @@ class StreamService : Service(), ConnectChecker {
     }
 
     override fun onConnectionStarted(url: String) {
+        if (!streamRequested) return
         streamConnected = false
         streamStatus = "Connecting"
         broadcastStatus()
     }
     override fun onConnectionSuccess() {
+        if (!streamRequested) return
         streamConnected = true
         streamStatus = if (platform == "yt") "YouTube Live connected" else "Live connected"
         broadcastStatus()
     }
     override fun onConnectionFailed(reason: String) {
+        if (!streamRequested) return
+        streamRequested = false
         streamConnected = false
-        streamStatus = "Connection failed: $reason"
+        streamStatus = if (reason.contains("EOF", ignoreCase = true)) {
+            "RTMP handshake closed. Check server/app/key URL and RTMP 1935 vs RTMPS 443."
+        } else {
+            "Connection failed: $reason"
+        }
+        val errorStatus = streamStatus
+        val d = display
+        if (d?.isStreaming == true) d.stopStream()
         broadcastStatus()
-        stop(streamStatus)
+        if (d?.isRecording != true) stop(errorStatus)
     }
     override fun onNewBitrate(bitrate: Long) {}
     override fun onDisconnect() {
-        if (!running) return
+        if (!running || !streamRequested) return
         streamConnected = false
         streamStatus = "Disconnected"
         broadcastStatus()
