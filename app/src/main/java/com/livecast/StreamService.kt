@@ -47,7 +47,10 @@ class StreamService : Service(), ConnectChecker {
         val w = if (landscape) 1280 else 720
         val h = if (landscape) 720 else 1280
         val d = RtmpDisplay(this, true, this)
-        d.setIntent(i.getIntExtra("code", 0), i.getParcelableExtra("data")!!)
+        d.setIntentResult(
+            i.getIntExtra("code", 0),
+            i.getParcelableExtra("data")
+        )
         d.prepareVideo(w, h, 30, 2_500_000, 0, resources.displayMetrics.densityDpi)
         d.prepareAudio(128 * 1024, 44100, true)
         d.startStream(rtmpUrl)
