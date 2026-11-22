@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.BroadcastReceiver
+import android.content.ComponentName
+import android.content.ServiceConnection
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -13,7 +15,10 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.view.Gravity
+import android.view.Surface
+import android.view.SurfaceHolder
 import android.view.View
 import android.widget.*
 import java.net.InetSocketAddress
@@ -32,17 +37,58 @@ class MainActivity : Activity() {
     private lateinit var recordBtn: Button
     private lateinit var connectBtn: Button
     private lateinit var destinationStatus: TextView
+    private lateinit var destinationDot: View
     private lateinit var tickerPosition: RadioGroup
     private lateinit var tickerFont: Spinner
     private lateinit var tickerSize: SeekBar
     private lateinit var tickerSizeLabel: TextView
     private lateinit var tickerColor: Spinner
     private lateinit var previewCard: LinearLayout
+    private lateinit var previewView: SurfaceView
+    private lateinit var previewHint: TextView
     private lateinit var streamDot: View
     private lateinit var chatDot: View
     private lateinit var streamStatus: TextView
     private lateinit var chatStatus: TextView
     private var pendingMode = "stream"
+    private var streamService: StreamService? = null
+    private var serviceBound = false
+    private var previewSurface: Surface? = null
+    private var previewWidth = 0
+    private var previewHeight = 0
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            streamService = (binder as? StreamService.LocalBinder)?.getService()
+            serviceBound = streamService != null
+            attachPreview()
+            updateStatus()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            streamService = null
+            serviceBound = false
+        }
+    }
+
+    private val previewCallback = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            previewSurface = holder.surface
+            attachPreview()
+        }
+
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            previewSurface = holder.surface
+            previewWidth = width
+            previewHeight = height
+            attachPreview()
+        }
+
+        override fun surfaceDestroyed(holder: SurfaceHolder) {
+            previewSurface = null
+            streamService?.updatePreview(null, 0, 0)
+        }
+    }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -88,17 +134,23 @@ class MainActivity : Activity() {
 
         previewCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(12), dp(36), dp(12), dp(36))
-            minimumHeight = dp(150)
             background = rounded("#0B0F16")
-            addView(TextView(this@MainActivity).apply {
-                text = "SCREEN PREVIEW"
+            previewView = SurfaceView(this@MainActivity).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(210)
+                )
+                holder.addCallback(previewCallback)
+            }
+            addView(previewView)
+            previewHint = TextView(this@MainActivity).apply {
+                text = "Preview will appear here after screen capture starts."
                 setTextColor(Color.parseColor("#DDE4EE"))
-                textSize = 14f
-                typeface = Typeface.DEFAULT_BOLD
+                textSize = 12f
                 gravity = Gravity.CENTER
-            })
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+            }
+            addView(previewHint)
             root.addView(this)
         }
 
@@ -109,9 +161,16 @@ class MainActivity : Activity() {
             setAllCaps(false)
             root.addView(this)
         }
-        destinationStatus = statusText("Paste an RTMP URL to check the server")
+        val destinationRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        destinationDot = statusDot(Color.RED)
+        destinationStatus = statusText("Server not checked")
         destinationStatus.setPadding(0, dp(4), 0, dp(4))
-        root.addView(destinationStatus)
+        destinationRow.addView(destinationDot)
+        destinationRow.addView(destinationStatus)
+        root.addView(destinationRow)
         connectBtn.setOnClickListener { checkDestination() }
 
         root.addView(label("Scrolling ticker"))
@@ -210,9 +269,7 @@ class MainActivity : Activity() {
         preview.setOnCheckedChangeListener { _, on ->
             StreamService.previewEnabled = on
             previewCard.visibility = if (on) View.VISIBLE else View.GONE
-            if (StreamService.running) {
-                startService(Intent(this, StreamService::class.java).setAction("PREVIEW"))
-            }
+            if (!on) streamService?.updatePreview(null, 0, 0) else attachPreview()
         }
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -319,16 +376,16 @@ class MainActivity : Activity() {
                 Socket().use { socket ->
                     socket.connect(InetSocketAddress(host, port), 5000)
                 }
-                "Server reachable. Tap STREAM to start sending video."
+                "RTMP server reachable. Tap STREAM to start the live broadcast."
             } catch (e: java.io.IOException) {
                 "Server check failed: ${e.message ?: "connection refused"}"
             }
             runOnUiThread {
                 connectBtn.isEnabled = true
                 destinationStatus.text = result
-                destinationStatus.setTextColor(
-                    if (result.startsWith("Server reachable")) Color.GREEN else Color.RED
-                )
+                val reachable = result.startsWith("RTMP server reachable")
+                destinationStatus.setTextColor(if (reachable) Color.GREEN else Color.RED)
+                setDot(destinationDot, if (reachable) Color.GREEN else Color.RED)
             }
         }.start()
     }
@@ -365,11 +422,18 @@ class MainActivity : Activity() {
     }
 
     private fun updateStatus() {
-        setDot(streamDot, if (StreamService.streamConnected) Color.GREEN else Color.RED)
+        setDot(
+            streamDot,
+            when {
+                StreamService.streamConnected -> Color.GREEN
+                StreamService.streamStatus == "Connecting" -> Color.YELLOW
+                else -> Color.RED
+            }
+        )
         streamStatus.text = StreamService.streamStatus
         btn.text = when {
             StreamService.streamConnected -> "STOP STREAM"
-            StreamService.streamStatus == "Connecting" -> "CONNECTING..."
+            StreamService.streamStatus == "Connecting" -> "CANCEL STREAM"
             else -> "STREAM"
         }
         recordBtn.text = if (StreamService.recording) "STOP RECORDING" else "RECORD"
@@ -384,17 +448,33 @@ class MainActivity : Activity() {
     }
 
     private val statusReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) = updateStatus()
+        override fun onReceive(context: Context?, intent: Intent?) {
+            updateStatus()
+            attachPreview()
+        }
     }
 
     private fun askPermissions() {
-        val p = mutableListOf(Manifest.permission.RECORD_AUDIO)
-        if (Build.VERSION.SDK_INT >= 33) p += Manifest.permission.POST_NOTIFICATIONS
-        requestPermissions(p.toTypedArray(), 1)
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+        } else {
+            requestScreenCapture()
+        }
     }
 
     override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
-        if (r.isNotEmpty() && r.any { it != android.content.pm.PackageManager.PERMISSION_GRANTED }) return
+        super.onRequestPermissionsResult(c, p, r)
+        if (c != 1) return
+        if (r.isEmpty() || r[0] != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            StreamService.streamStatus = "Microphone permission denied"
+            updateStatus()
+            Toast.makeText(this, "Allow microphone permission to start capture.", Toast.LENGTH_LONG).show()
+            return
+        }
+        requestScreenCapture()
+    }
+
+    private fun requestScreenCapture() {
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         startActivityForResult(mpm.createScreenCaptureIntent(), 2)
     }
@@ -408,21 +488,56 @@ class MainActivity : Activity() {
             @Suppress("DEPRECATION")
             registerReceiver(statusReceiver, filter)
         }
+        serviceBound = bindService(
+            Intent(this, StreamService::class.java),
+            serviceConnection,
+            Context.BIND_AUTO_CREATE
+        )
         updateStatus()
     }
 
     override fun onStop() {
         try { unregisterReceiver(statusReceiver) } catch (_: IllegalArgumentException) {}
+        if (serviceBound) {
+            streamService?.updatePreview(null, 0, 0)
+            unbindService(serviceConnection)
+            serviceBound = false
+            streamService = null
+        }
         super.onStop()
     }
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
-        if (req != 2 || res != RESULT_OK || data == null) return
+        super.onActivityResult(req, res, data)
+        if (req != 2) return
+        if (res != RESULT_OK || data == null) {
+            StreamService.streamStatus = "Screen capture permission cancelled"
+            updateStatus()
+            return
+        }
         saveSettings()
         val i = Intent(this, StreamService::class.java).setAction("START")
             .putExtra("code", res)
             .putExtra("data", data)
             .putExtra("mode", pendingMode)
-        startForegroundService(i)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+        } catch (e: RuntimeException) {
+            StreamService.streamStatus = "Could not start service: ${e.message ?: "check permissions"}"
+            updateStatus()
+        }
+    }
+
+    private fun attachPreview() {
+        if (!preview.isChecked || previewSurface == null || previewWidth <= 0 || previewHeight <= 0) return
+        val service = streamService ?: return
+        try {
+            service.updatePreview(previewSurface, previewWidth, previewHeight)
+            previewHint.text = if (StreamService.running) "Screen capture preview" else "Preview will appear after capture starts."
+        } catch (e: RuntimeException) {
+            previewHint.text = "Preview error: ${e.message ?: "surface is unavailable"}"
+            StreamService.streamStatus = "Preview error: ${e.message ?: "surface is unavailable"}"
+            updateStatus()
+        }
     }
 }

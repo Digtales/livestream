@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.os.*
+import android.view.Surface
 import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.gl.render.filters.`object`.ImageObjectFilterRender
 import com.pedro.encoder.utils.gl.TranslateTo
@@ -14,6 +15,10 @@ import java.io.File
 import kotlin.math.max
 
 class StreamService : Service(), ConnectChecker {
+    inner class LocalBinder : Binder() {
+        fun getService() = this@StreamService
+    }
+
     companion object {
         const val STATUS_ACTION = "com.livecast.STATUS"
         var running = false
@@ -37,20 +42,43 @@ class StreamService : Service(), ConnectChecker {
     private val chat = ArrayList<String>()
     private var poller: ChatPoller? = null
     private var scrollX = 0f
+    private val binder = LocalBinder()
 
-    override fun onBind(i: Intent?) = null
+    override fun onBind(i: Intent?) = binder
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
-        when (i?.action) {
-            "START" -> start(i)
-            "STREAM" -> startStream()
-            "STOP_STREAM" -> stopStream()
-            "RECORD" -> toggleRecord()
-            "MIC" -> if (micOn) display?.enableAudio() else display?.disableAudio()
-            "PREVIEW" -> Unit
-            "STOP" -> stop()
+        try {
+            when (i?.action) {
+                "START" -> start(i)
+                "STREAM" -> startStream()
+                "STOP_STREAM" -> stopStream()
+                "RECORD" -> toggleRecord()
+                "MIC" -> if (micOn) display?.enableAudio() else display?.disableAudio()
+                "STOP" -> stop()
+            }
+        } catch (e: java.io.IOException) {
+            stop("Error: ${e.message ?: "could not access recording storage"}")
+        } catch (e: RuntimeException) {
+            stop("Error: ${e.message ?: "could not start capture"}")
         }
         return START_NOT_STICKY
+    }
+
+    fun updatePreview(surface: Surface?, width: Int, height: Int) {
+        val d = display ?: return
+        if (!previewEnabled || surface == null) {
+            if (d.isOnPreview) d.stopPreview()
+            return
+        }
+        if (width <= 0 || height <= 0) return
+        try {
+            if (d.isOnPreview) d.stopPreview()
+            d.startPreview(surface, width, height)
+        } catch (e: RuntimeException) {
+            streamStatus = "Preview error: ${e.message ?: "surface is unavailable"}"
+            broadcastStatus()
+            throw e
+        }
     }
 
     private fun start(i: Intent) {
@@ -74,10 +102,12 @@ class StreamService : Service(), ConnectChecker {
             i.getIntExtra("code", 0),
             i.getParcelableExtra("data")
         )
-        check(d.prepareVideo(w, h, 30, 2_500_000, 0, resources.displayMetrics.densityDpi)) {
-            "Could not prepare screen video encoder"
+        if (!d.prepareVideo(w, h, 30, 2_500_000, 0, resources.displayMetrics.densityDpi)) {
+            throw IllegalStateException("Could not prepare screen video encoder")
         }
-        check(d.prepareAudio(128 * 1024, 44100, true)) { "Could not prepare microphone audio encoder" }
+        if (!d.prepareAudio(128 * 1024, 44100, true)) {
+            throw IllegalStateException("Could not prepare microphone audio encoder. Check microphone permission.")
+        }
         if (!micOn) d.disableAudio()
         display = d
         running = true
@@ -198,12 +228,12 @@ class StreamService : Service(), ConnectChecker {
         }
     }
 
-    private fun stop() {
+    private fun stop(errorStatus: String? = null) {
         running = false
         streamConnected = false
         recording = false
         chatConnected = false
-        streamStatus = "Disconnected"
+        streamStatus = errorStatus ?: "Disconnected"
         broadcastStatus()
         handler.removeCallbacksAndMessages(null)
         poller?.stopPolling()
@@ -231,12 +261,13 @@ class StreamService : Service(), ConnectChecker {
     }
     override fun onConnectionFailed(reason: String) {
         streamConnected = false
-        streamStatus = "Connection failed"
+        streamStatus = "Connection failed: $reason"
         broadcastStatus()
-        stop()
+        stop(streamStatus)
     }
     override fun onNewBitrate(bitrate: Long) {}
     override fun onDisconnect() {
+        if (!running) return
         streamConnected = false
         streamStatus = "Disconnected"
         broadcastStatus()
