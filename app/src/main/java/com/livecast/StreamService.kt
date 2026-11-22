@@ -40,6 +40,7 @@ class StreamService : Service(), ConnectChecker {
         var lastRecordingPath = ""
         var chatConnected = false
         var streamStatus = "Disconnected"
+        var outputAspectRatio = 9f / 16f
         var platform = ""
         var rtmpUrl = ""; var tickerText = ""; var chatSource = ""; var chatTarget = ""; var chatToken = ""
         var landscape = false; var micOn = true
@@ -255,6 +256,7 @@ class StreamService : Service(), ConnectChecker {
         val rotation = if (landscape) 0 else 90
         val outputWidth = if (landscape) encoderWidth else encoderHeight
         val outputHeight = if (landscape) encoderHeight else encoderWidth
+        outputAspectRatio = outputWidth.toFloat() / outputHeight
         val d = RtmpDisplay(this, true, this)
         d.setIntentResult(
             i.getIntExtra("code", 0),

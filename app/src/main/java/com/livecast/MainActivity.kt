@@ -15,7 +15,10 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.os.IBinder
+import android.util.Base64
 import android.view.Gravity
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -28,8 +31,15 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.core.content.FileProvider
 import java.io.File
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.GeneralSecurityException
+import java.security.KeyStore
+import java.security.spec.GCMParameterSpec
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 
 class MainActivity : Activity() {
     private lateinit var url: EditText
@@ -52,8 +62,7 @@ class MainActivity : Activity() {
     private lateinit var tickerSize: SeekBar
     private lateinit var tickerSizeLabel: TextView
     private lateinit var tickerColor: Spinner
-    private lateinit var previewCard: LinearLayout
-    private lateinit var previewFrame: FrameLayout
+    private lateinit var previewFrame: AspectRatioFrameLayout
     private lateinit var previewView: SurfaceView
     private lateinit var overlayPreview: TextView
     private lateinit var previewHint: TextView
@@ -61,6 +70,11 @@ class MainActivity : Activity() {
     private lateinit var chatDot: View
     private lateinit var streamStatus: TextView
     private lateinit var chatStatus: TextView
+    private lateinit var settingsPage: ScrollView
+    private lateinit var livePage: LinearLayout
+    private lateinit var pageHost: FrameLayout
+    private lateinit var liveTabButton: Button
+    private lateinit var settingsTabButton: Button
     private var pendingMode = "stream"
     private var streamService: StreamService? = null
     private var serviceBound = false
@@ -68,6 +82,9 @@ class MainActivity : Activity() {
     private var previewSurface: Surface? = null
     private var previewWidth = 0
     private var previewHeight = 0
+    private var cachedStreamKey: String? = null
+    private var cachedEncryptedStreamKey: String? = null
+    private val settingsPreferences by lazy { getSharedPreferences("livecast_settings", MODE_PRIVATE) }
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -80,6 +97,30 @@ class MainActivity : Activity() {
         override fun onServiceDisconnected(name: ComponentName?) {
             streamService = null
             serviceBound = false
+        }
+    }
+
+    private class AspectRatioFrameLayout(context: Context) : FrameLayout(context) {
+        var aspectRatio: Float = 9f / 16f
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            val maxWidth = View.MeasureSpec.getSize(widthMeasureSpec)
+            val maxHeight = View.MeasureSpec.getSize(heightMeasureSpec)
+            if (maxWidth <= 0 || maxHeight <= 0 || aspectRatio <= 0f) {
+                super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+                return
+            }
+
+            var width = maxWidth
+            var height = (width / aspectRatio).toInt()
+            if (height > maxHeight) {
+                height = maxHeight
+                width = (height * aspectRatio).toInt()
+            }
+            setMeasuredDimension(width, height)
+            val exactWidth = View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY)
+            val exactHeight = View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+            measureChildren(exactWidth, exactHeight)
         }
     }
 
@@ -124,7 +165,7 @@ class MainActivity : Activity() {
             background = rounded("#1D2635")
             root.addView(this)
         }
-        TextView(this).apply {
+        val appTitle = TextView(this).apply {
             text = "LIVE CAST"
             setTextColor(Color.WHITE)
             textSize = 22f
@@ -144,14 +185,14 @@ class MainActivity : Activity() {
         statusRow.addView(statusItem(chatDot, chatStatus))
         root.addView(statusRow)
 
-        previewCard = LinearLayout(this).apply {
+        val previewCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = rounded("#0B0F16")
-            previewFrame = FrameLayout(this@MainActivity)
+            previewFrame = AspectRatioFrameLayout(this@MainActivity)
             previewView = SurfaceView(this@MainActivity).apply {
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(210)
+                    ViewGroup.LayoutParams.MATCH_PARENT
                 )
                 holder.addCallback(previewCallback)
             }
@@ -176,7 +217,14 @@ class MainActivity : Activity() {
                     Gravity.BOTTOM
                 )
             )
-            addView(previewFrame)
+            addView(
+                previewFrame,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    0,
+                    1f
+                ).apply { gravity = Gravity.CENTER }
+            )
             previewHint = TextView(this@MainActivity).apply {
                 text = "Turn Preview on to select a screen or app."
                 setTextColor(Color.parseColor("#DDE4EE"))
@@ -236,7 +284,10 @@ class MainActivity : Activity() {
                 })
             }
             check(11)
-            setOnCheckedChangeListener { _, _ -> updateOverlayPreview() }
+            setOnCheckedChangeListener { _, _ ->
+                updateOverlayPreview()
+                persistSettings()
+            }
             root.addView(this)
         }
         root.addView(label("Ticker font"))
@@ -251,6 +302,7 @@ class MainActivity : Activity() {
         tickerFont.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 updateOverlayPreview()
+                persistSettings()
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
@@ -266,6 +318,7 @@ class MainActivity : Activity() {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 tickerSizeLabel.text = "${progress + 14} px"
                 updateOverlayPreview()
+                persistSettings()
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
@@ -282,6 +335,7 @@ class MainActivity : Activity() {
         tickerColor.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 updateOverlayPreview()
+                persistSettings()
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
@@ -296,29 +350,35 @@ class MainActivity : Activity() {
                 })
             }
             check(1)
+            setOnCheckedChangeListener { _, _ -> persistSettings() }
             root.addView(this)
         }
         root.addView(label("Live chat (optional)"))
         chatId = et("Live chat ID or Facebook video ID")
         token = et("OAuth access token")
-        root.addView(label("Orientation"))
+        root.addView(label("Video orientation"))
         orient = RadioGroup(this).apply {
             orientation = RadioGroup.HORIZONTAL
-            listOf("Portrait", "Landscape").forEachIndexed { i, text ->
+            listOf("Portrait", "Landscape", "Auto").forEachIndexed { i, text ->
                 addView(RadioButton(context).apply {
                     this.text = text
                     id = i + 1
                     setTextColor(Color.WHITE)
                 })
             }
-            check(
-                if (resources.configuration.orientation ==
-                    android.content.res.Configuration.ORIENTATION_LANDSCAPE
-                ) 2 else 1
-            )
-            setOnCheckedChangeListener { _, _ -> updatePreviewAspectRatio() }
+            check(3)
+            setOnCheckedChangeListener { _, _ ->
+                updatePreviewAspectRatio()
+                persistSettings()
+            }
             root.addView(this)
         }
+        root.addView(TextView(this).apply {
+            text = "Auto uses the tablet's current orientation when capture starts. Stop and restart capture after rotating to change the stream format."
+            setTextColor(Color.parseColor("#AAB3C2"))
+            textSize = 12f
+            setPadding(0, dp(4), 0, dp(8))
+        })
         mic = Switch(this).apply {
             text = "Microphone"
             setTextColor(Color.WHITE)
@@ -327,6 +387,7 @@ class MainActivity : Activity() {
         }
         mic.setOnCheckedChangeListener { _, on ->
             StreamService.micOn = on
+            persistSettings()
             if (StreamService.running) startService(Intent(this, StreamService::class.java).setAction("MIC"))
         }
         preview = Switch(this).apply {
@@ -370,15 +431,20 @@ class MainActivity : Activity() {
             if (StreamService.streamConnected || StreamService.streamStatus == "Connecting") {
                 startService(Intent(this, StreamService::class.java).setAction("STOP_STREAM"))
             } else {
+                showPage(false)
                 enablePreviewForCapture()
                 if (StreamService.previewOnly) {
                     startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
                     if (!validRtmpUrl()) return@setOnClickListener
                     pendingMode = "stream"
+                    StreamService.streamStatus = "Waiting for screen capture permission"
+                    updateStatus()
                     askPermissions()
                 } else if (!StreamService.running) {
                     if (!validRtmpUrl()) return@setOnClickListener
                     pendingMode = "stream"
+                    StreamService.streamStatus = "Waiting for screen capture permission"
+                    updateStatus()
                     askPermissions()
                 } else {
                     startService(Intent(this, StreamService::class.java).setAction("STREAM"))
@@ -390,13 +456,18 @@ class MainActivity : Activity() {
             if (StreamService.recording) {
                 startService(Intent(this, StreamService::class.java).setAction("RECORD"))
             } else {
+                showPage(false)
                 enablePreviewForCapture()
                 if (StreamService.previewOnly) {
                     startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
                     pendingMode = "record"
+                    StreamService.recordStatus = "Waiting for screen capture permission..."
+                    updateStatus()
                     askPermissions()
                 } else if (!StreamService.running) {
                     pendingMode = "record"
+                    StreamService.recordStatus = "Waiting for screen capture permission..."
+                    updateStatus()
                     askPermissions()
                 } else {
                     startService(Intent(this, StreamService::class.java).setAction("RECORD"))
@@ -406,13 +477,280 @@ class MainActivity : Activity() {
         val openRecordingButton = actionButton("OPEN LAST RECORDING", "#334155")
         root.addView(openRecordingButton)
         openRecordingButton.setOnClickListener { openLastRecording() }
-        setContentView(ScrollView(this).apply { addView(root) })
-        updatePreviewAspectRatio()
+        buildResponsivePages(
+            root,
+            appTitle,
+            statusRow,
+            previewCard,
+            actionRow,
+            openRecordingButton
+        )
+        restoreSettings()
+        bindSettingsPersistence()
+        saveSettings()
+        setContentView(root)
+        showPage(false)
         updateOverlayPreview()
         updateStatus()
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+    private fun buildResponsivePages(
+        root: LinearLayout,
+        appTitle: TextView,
+        statusRow: LinearLayout,
+        previewCard: LinearLayout,
+        actionRow: LinearLayout,
+        openRecordingButton: Button
+    ) {
+        val settingsViews = (0 until root.childCount)
+            .map { root.getChildAt(it) }
+            .filterNot {
+                it === appTitle ||
+                    it === statusRow ||
+                    it === previewCard ||
+                    it === preview ||
+                    it === actionRow ||
+                    it === recordingStatus ||
+                    it === openRecordingButton
+            }
+        root.removeAllViews()
+
+        livePage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(4), 0, dp(4))
+            addView(
+                previewCard,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    0,
+                    1f
+                )
+            )
+            addView(
+                preview,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(6) }
+            )
+            addView(
+                openRecordingButton,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(4) }
+            )
+        }
+
+        val settingsContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(4), dp(4), dp(4), dp(12))
+            settingsViews.forEach { addView(it) }
+        }
+        settingsPage = ScrollView(this).apply {
+            isFillViewport = true
+            visibility = View.GONE
+            addView(
+                settingsContent,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+
+        pageHost = FrameLayout(this)
+        pageHost.addView(
+            livePage,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        pageHost.addView(
+            settingsPage,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        liveTabButton = actionButton("LIVE PREVIEW", "#2563EB")
+        settingsTabButton = actionButton("SETTINGS", "#334155")
+        val tabBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(liveTabButton, weightedButtonParams())
+            addView(settingsTabButton, weightedButtonParams())
+        }
+        liveTabButton.setOnClickListener { showPage(false) }
+        settingsTabButton.setOnClickListener { showPage(true) }
+
+        root.addView(appTitle)
+        root.addView(statusRow)
+        root.addView(actionRow)
+        root.addView(recordingStatus)
+        root.addView(
+            pageHost,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+        root.addView(tabBar)
+    }
+
+    private fun showPage(showSettings: Boolean) {
+        if (!::settingsPage.isInitialized || !::livePage.isInitialized) return
+        livePage.visibility = if (showSettings) View.GONE else View.VISIBLE
+        settingsPage.visibility = if (showSettings) View.VISIBLE else View.GONE
+        if (::liveTabButton.isInitialized && ::settingsTabButton.isInitialized) {
+            liveTabButton.alpha = if (showSettings) 0.65f else 1f
+            settingsTabButton.alpha = if (showSettings) 1f else 0.65f
+        }
+    }
+
+    private fun restoreSettings() {
+        val prefs = settingsPreferences
+        url.setText(prefs.getString("server_url", "rtmp://a.rtmp.youtube.com/live2"))
+        cachedEncryptedStreamKey = prefs.getString("stream_key", "")
+        cachedStreamKey = decryptStreamKey(cachedEncryptedStreamKey.orEmpty())
+        streamKey.setText(cachedStreamKey)
+        ticker.setText(prefs.getString("ticker_text", ""))
+        tickerPosition.check(prefs.getInt("ticker_position", 11))
+        tickerFont.setSelection(prefs.getInt("ticker_font", 0).coerceIn(0, 3))
+        tickerSize.progress = (prefs.getInt("ticker_size", 24) - 14).coerceIn(0, 28)
+        tickerColor.setSelection(prefs.getInt("ticker_color", 0).coerceIn(0, 4))
+        platform.check(prefs.getInt("platform", 1).coerceIn(1, 3))
+        chatId.setText(prefs.getString("chat_id", ""))
+        orient.check(
+            prefs.getInt(
+                "orientation",
+                3
+            ).coerceIn(1, 3)
+        )
+        mic.isChecked = prefs.getBoolean("microphone", true)
+        preview.isChecked = StreamService.previewEnabled
+        updatePreviewAspectRatio()
+    }
+
+    private fun bindSettingsPersistence() {
+        listOf(url, streamKey, ticker, chatId).forEach { field ->
+            field.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    persistSettings()
+                }
+            })
+        }
+    }
+
+    private fun persistSettings() {
+        if (!::url.isInitialized ||
+            !::streamKey.isInitialized ||
+            !::ticker.isInitialized ||
+            !::tickerPosition.isInitialized ||
+            !::tickerFont.isInitialized ||
+            !::tickerSize.isInitialized ||
+            !::tickerColor.isInitialized ||
+            !::platform.isInitialized ||
+            !::chatId.isInitialized ||
+            !::orient.isInitialized ||
+            !::mic.isInitialized
+        ) return
+        val currentStreamKey = streamKey.text.toString()
+        val encryptedStreamKey = if (currentStreamKey == cachedStreamKey &&
+            cachedEncryptedStreamKey != null
+        ) {
+            cachedEncryptedStreamKey.orEmpty()
+        } else {
+            try {
+                encryptStreamKey(currentStreamKey)
+            } catch (e: GeneralSecurityException) {
+                streamKey.error = "Unable to securely save stream key: ${e.message ?: "Keystore error"}"
+                return
+            }
+        }
+        streamKey.error = null
+        cachedStreamKey = currentStreamKey
+        cachedEncryptedStreamKey = encryptedStreamKey
+        settingsPreferences.edit()
+            .putString("server_url", url.text.toString())
+            .putString("stream_key", encryptedStreamKey)
+            .putString("ticker_text", ticker.text.toString())
+            .putInt("ticker_position", tickerPosition.checkedRadioButtonId)
+            .putInt("ticker_font", tickerFont.selectedItemPosition)
+            .putInt("ticker_size", tickerSize.progress + 14)
+            .putInt("ticker_color", tickerColor.selectedItemPosition)
+            .putInt("platform", platform.checkedRadioButtonId)
+            .putString("chat_id", chatId.text.toString())
+            .putInt("orientation", orient.checkedRadioButtonId)
+            .putBoolean("microphone", mic.isChecked)
+            .apply()
+    }
+
+    private fun decryptStreamKey(encoded: String): String {
+        if (encoded.isEmpty()) return ""
+        return try {
+            val encrypted = Base64.decode(encoded, Base64.NO_WRAP)
+            if (encrypted.size <= 12) throw GeneralSecurityException("Saved key data is invalid")
+            val iv = encrypted.copyOfRange(0, 12)
+            val ciphertext = encrypted.copyOfRange(12, encrypted.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, streamKeyEncryptionKey(), GCMParameterSpec(128, iv))
+            String(cipher.doFinal(ciphertext), Charsets.UTF_8)
+        } catch (e: IllegalArgumentException) {
+            clearSavedStreamKey()
+            Toast.makeText(this, "Saved stream key is invalid. Enter it again.", Toast.LENGTH_LONG).show()
+            ""
+        } catch (e: GeneralSecurityException) {
+            clearSavedStreamKey()
+            Toast.makeText(this, "Saved stream key could not be unlocked. Enter it again.", Toast.LENGTH_LONG).show()
+            ""
+        }
+    }
+
+    private fun encryptStreamKey(value: String): String {
+        if (value.isEmpty()) return ""
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, streamKeyEncryptionKey())
+        val ciphertext = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+        return Base64.encodeToString(cipher.iv + ciphertext, Base64.NO_WRAP)
+    }
+
+    private fun streamKeyEncryptionKey(): SecretKey {
+        val keyStore = KeyStore.getInstance("AndroidKeyStore")
+        try {
+            keyStore.load(null)
+        } catch (e: IOException) {
+            throw GeneralSecurityException("Could not access Android Keystore", e)
+        } catch (e: GeneralSecurityException) {
+            throw GeneralSecurityException("Could not access Android Keystore", e)
+        }
+        val existing = keyStore.getKey("livecast_stream_key", null) as? SecretKey
+        if (existing != null) return existing
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        generator.init(
+            KeyGenParameterSpec.Builder(
+                "livecast_stream_key",
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setRandomizedEncryptionRequired(true)
+                .build()
+        )
+        return generator.generateKey()
+    }
+
+    private fun clearSavedStreamKey() {
+        settingsPreferences.edit().remove("stream_key").apply()
+        cachedStreamKey = ""
+        cachedEncryptedStreamKey = ""
+    }
 
     private fun rounded(color: String) = GradientDrawable().apply {
         shape = GradientDrawable.RECTANGLE
@@ -452,7 +790,11 @@ class MainActivity : Activity() {
         typeface = Typeface.DEFAULT_BOLD
         setAllCaps(false)
         setPadding(dp(4), dp(12), dp(4), dp(12))
-        background = rounded(color)
+        val pressedColor = if (color == "#E11D48") "#BE123C" else "#1D4ED8"
+        background = android.graphics.drawable.StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_pressed), rounded(pressedColor))
+            addState(intArrayOf(), rounded(color))
+        }
     }
 
     private fun weightedButtonParams() = LinearLayout.LayoutParams(
@@ -471,23 +813,27 @@ class MainActivity : Activity() {
     }
 
     private fun updatePreviewAspectRatio() {
-        if (!::previewView.isInitialized || !::previewFrame.isInitialized || !::orient.isInitialized) return
+        if (!::previewFrame.isInitialized || !::orient.isInitialized) return
+        if (StreamService.running && !StreamService.previewOnly) {
+            previewFrame.aspectRatio = StreamService.outputAspectRatio
+            previewFrame.requestLayout()
+            return
+        }
         val metrics = resources.displayMetrics
         val longSide = maxOf(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(2)
         val shortSide = minOf(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(2)
-        val aspectRatio = if (orient.checkedRadioButtonId == 2) {
+        val landscapeOutput = when (orient.checkedRadioButtonId) {
+            1 -> false
+            2 -> true
+            else -> resources.configuration.orientation ==
+                android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        }
+        previewFrame.aspectRatio = if (landscapeOutput) {
             longSide.toFloat() / shortSide
         } else {
             shortSide.toFloat() / longSide
         }
-        val width = previewFrame.width.takeIf { it > 0 }
-            ?: (metrics.widthPixels - dp(36)).coerceAtLeast(dp(120))
-        val height = (width / aspectRatio).toInt().coerceAtLeast(dp(160))
-        val params = previewView.layoutParams as? FrameLayout.LayoutParams ?: return
-        if (params.height != height) {
-            params.height = height
-            previewView.layoutParams = params
-        }
+        previewFrame.requestLayout()
     }
 
     private fun validRtmpUrl(): Boolean {
@@ -558,7 +904,12 @@ class MainActivity : Activity() {
             }
             chatTarget = this@MainActivity.chatId.text.toString().trim()
             chatToken = this@MainActivity.token.text.toString().trim()
-            landscape = this@MainActivity.orient.checkedRadioButtonId == 2
+            landscape = when (this@MainActivity.orient.checkedRadioButtonId) {
+                1 -> false
+                2 -> true
+                else -> resources.configuration.orientation ==
+                    android.content.res.Configuration.ORIENTATION_LANDSCAPE
+            }
             micOn = this@MainActivity.mic.isChecked
             tickerPosition = if (this@MainActivity.tickerPosition.checkedRadioButtonId == 10) "top" else "bottom"
             tickerFont = this@MainActivity.tickerFont.selectedItem.toString()
@@ -571,6 +922,8 @@ class MainActivity : Activity() {
                 else -> Color.WHITE
             }
         }
+        persistSettings()
+        updatePreviewAspectRatio()
     }
 
     private fun updateOverlayPreview() {
@@ -608,6 +961,7 @@ class MainActivity : Activity() {
             params.gravity = gravity
             overlayPreview.layoutParams = params
         }
+        persistSettings()
     }
 
     private fun openLastRecording() {
@@ -640,7 +994,8 @@ class MainActivity : Activity() {
             streamDot,
             when {
                 StreamService.streamConnected -> Color.GREEN
-                StreamService.streamStatus == "Connecting" -> Color.YELLOW
+                StreamService.streamStatus == "Connecting" ||
+                    StreamService.streamStatus.startsWith("Waiting") -> Color.YELLOW
                 else -> Color.RED
             }
         )
@@ -648,9 +1003,17 @@ class MainActivity : Activity() {
         btn.text = when {
             StreamService.streamConnected -> "STOP STREAM"
             StreamService.streamStatus == "Connecting" -> "CANCEL STREAM"
+            StreamService.streamStatus.startsWith("Waiting") -> "PLEASE WAIT..."
             else -> "GO LIVE"
         }
-        recordBtn.text = if (StreamService.recording) "STOP RECORDING" else "RECORD"
+        recordBtn.text = when {
+            StreamService.recording -> "STOP RECORDING"
+            StreamService.recordStatus.startsWith("Waiting") ||
+                StreamService.recordStatus.startsWith("Preparing") -> "STARTING..."
+            StreamService.recordStatus.startsWith("Finalizing") -> "FINALIZING..."
+            else -> "RECORD"
+        }
+        recordBtn.isEnabled = !StreamService.recordStatus.startsWith("Finalizing")
         recordingStatus.text = StreamService.recordStatus
         val chatEnabled = chatId.text.toString().trim().isNotEmpty() &&
             platform.checkedRadioButtonId != 3
@@ -681,7 +1044,11 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(c, p, r)
         if (c != 1) return
         if (r.isEmpty() || r[0] != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            StreamService.streamStatus = "Microphone permission denied"
+            if (pendingMode == "record") {
+                StreamService.recordStatus = "Recording permission denied"
+            } else {
+                StreamService.streamStatus = "Microphone permission denied"
+            }
             updateStatus()
             Toast.makeText(this, "Allow microphone permission to start capture.", Toast.LENGTH_LONG).show()
             return
@@ -712,6 +1079,7 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        persistSettings()
         try { unregisterReceiver(statusReceiver) } catch (_: IllegalArgumentException) {}
         if (serviceBound) {
             streamService?.updatePreview(null, 0, 0)
@@ -726,6 +1094,9 @@ class MainActivity : Activity() {
         super.onActivityResult(req, res, data)
         if (req != 2) return
         if (res != RESULT_OK || data == null) {
+            if (pendingMode == "record") {
+                StreamService.recordStatus = "Recording cancelled"
+            }
             StreamService.streamStatus = if (pendingMode == "preview") {
                 "Preview permission cancelled"
             } else {
@@ -745,7 +1116,12 @@ class MainActivity : Activity() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
         } catch (e: RuntimeException) {
-            StreamService.streamStatus = "Could not start service: ${e.message ?: "check permissions"}"
+            val message = e.message ?: "check permissions"
+            if (pendingMode == "record") {
+                StreamService.recordStatus = "Recording failed: $message"
+            } else {
+                StreamService.streamStatus = "Could not start service: $message"
+            }
             updateStatus()
         }
     }
