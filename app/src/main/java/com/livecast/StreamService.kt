@@ -19,6 +19,7 @@ import com.pedro.library.rtmp.RtmpDisplay
 import com.pedro.library.view.GlStreamInterface
 import java.io.File
 import kotlin.math.max
+import kotlin.math.min
 
 class StreamService : Service(), ConnectChecker {
     inner class LocalBinder : Binder() {
@@ -244,14 +245,30 @@ class StreamService : Service(), ConnectChecker {
             startForeground(1, n)
         }
 
-        val w = if (landscape) 1280 else 720
-        val h = if (landscape) 720 else 1280
+        val metrics = resources.displayMetrics
+        val screenLongSide = max(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(2)
+        val screenShortSide = min(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(2)
+        val encoderWidth = 1280
+        val encoderHeight = (
+            encoderWidth.toDouble() * screenShortSide / screenLongSide
+            ).toInt().coerceIn(2, encoderWidth) / 2 * 2
+        val rotation = if (landscape) 0 else 90
+        val outputWidth = if (landscape) encoderWidth else encoderHeight
+        val outputHeight = if (landscape) encoderHeight else encoderWidth
         val d = RtmpDisplay(this, true, this)
         d.setIntentResult(
             i.getIntExtra("code", 0),
             i.getParcelableExtra("data")
         )
-        if (!d.prepareVideo(w, h, 30, 2_500_000, 0, resources.displayMetrics.densityDpi)) {
+        if (!d.prepareVideo(
+                encoderWidth,
+                encoderHeight,
+                30,
+                2_500_000,
+                rotation,
+                metrics.densityDpi
+            )
+        ) {
             throw IllegalStateException("Could not prepare screen video encoder")
         }
         if (!d.prepareAudio(128 * 1024, 44100, true)) {
@@ -282,7 +299,7 @@ class StreamService : Service(), ConnectChecker {
         } else {
             startStream()
         }
-        handler.post(draw(w / 2, h / 2))
+        handler.post(draw(outputWidth / 2, outputHeight / 2))
     }
 
     private fun startStream() {

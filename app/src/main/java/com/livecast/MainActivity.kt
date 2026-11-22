@@ -311,7 +311,12 @@ class MainActivity : Activity() {
                     setTextColor(Color.WHITE)
                 })
             }
-            check(1)
+            check(
+                if (resources.configuration.orientation ==
+                    android.content.res.Configuration.ORIENTATION_LANDSCAPE
+                ) 2 else 1
+            )
+            setOnCheckedChangeListener { _, _ -> updatePreviewAspectRatio() }
             root.addView(this)
         }
         mic = Switch(this).apply {
@@ -402,6 +407,7 @@ class MainActivity : Activity() {
         root.addView(openRecordingButton)
         openRecordingButton.setOnClickListener { openLastRecording() }
         setContentView(ScrollView(this).apply { addView(root) })
+        updatePreviewAspectRatio()
         updateOverlayPreview()
         updateStatus()
     }
@@ -462,6 +468,26 @@ class MainActivity : Activity() {
         suppressPreviewChange = false
         StreamService.previewEnabled = true
         if (StreamService.running) attachPreview()
+    }
+
+    private fun updatePreviewAspectRatio() {
+        if (!::previewView.isInitialized || !::previewFrame.isInitialized || !::orient.isInitialized) return
+        val metrics = resources.displayMetrics
+        val longSide = maxOf(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(2)
+        val shortSide = minOf(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(2)
+        val aspectRatio = if (orient.checkedRadioButtonId == 2) {
+            longSide.toFloat() / shortSide
+        } else {
+            shortSide.toFloat() / longSide
+        }
+        val width = previewFrame.width.takeIf { it > 0 }
+            ?: (metrics.widthPixels - dp(36)).coerceAtLeast(dp(120))
+        val height = (width / aspectRatio).toInt().coerceAtLeast(dp(160))
+        val params = previewView.layoutParams as? FrameLayout.LayoutParams ?: return
+        if (params.height != height) {
+            params.height = height
+            previewView.layoutParams = params
+        }
     }
 
     private fun validRtmpUrl(): Boolean {
