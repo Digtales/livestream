@@ -259,7 +259,7 @@ class MainActivity : Activity() {
             }
             rtmpUrl = url.text.toString().trim()
             tickerText = ticker.text.toString()
-            chatSource = when (platform.checkedRadioButtonId) { 1 -> "yt"; 2 -> "fb"; else -> "" }
+            chatSource = when (this@MainActivity.platform.checkedRadioButtonId) { 1 -> "yt"; 2 -> "fb"; else -> "" }
             chatTarget = chatId.text.toString().trim()
             chatToken = token.text.toString().trim()
             landscape = orient.checkedRadioButtonId == 2
