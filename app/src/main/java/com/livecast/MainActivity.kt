@@ -19,6 +19,7 @@ import android.os.IBinder
 import android.view.Gravity
 import android.view.Surface
 import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import android.widget.*
 import java.net.InetSocketAddress

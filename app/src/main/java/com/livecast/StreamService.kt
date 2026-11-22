@@ -11,6 +11,7 @@ import com.pedro.encoder.input.gl.render.filters.`object`.ImageObjectFilterRende
 import com.pedro.encoder.utils.gl.TranslateTo
 import com.pedro.library.base.recording.RecordController
 import com.pedro.library.rtmp.RtmpDisplay
+import com.pedro.library.view.GlStreamInterface
 import java.io.File
 import kotlin.math.max
 
@@ -42,6 +43,7 @@ class StreamService : Service(), ConnectChecker {
     private val chat = ArrayList<String>()
     private var poller: ChatPoller? = null
     private var scrollX = 0f
+    private var attachedPreviewSurface: Surface? = null
     private val binder = LocalBinder()
 
     override fun onBind(i: Intent?) = binder
@@ -66,14 +68,19 @@ class StreamService : Service(), ConnectChecker {
 
     fun updatePreview(surface: Surface?, width: Int, height: Int) {
         val d = display ?: return
+        val gl = d.glInterface as? GlStreamInterface ?: return
         if (!previewEnabled || surface == null) {
-            if (d.isOnPreview) d.stopPreview()
+            gl.deAttachPreview()
+            attachedPreviewSurface = null
             return
         }
         if (width <= 0 || height <= 0) return
         try {
-            if (d.isOnPreview) d.stopPreview()
-            d.startPreview(surface, width, height)
+            gl.setPreviewResolution(width, height)
+            if (attachedPreviewSurface !== surface) {
+                gl.attachPreview(surface)
+                attachedPreviewSurface = surface
+            }
         } catch (e: RuntimeException) {
             streamStatus = "Preview error: ${e.message ?: "surface is unavailable"}"
             broadcastStatus()
