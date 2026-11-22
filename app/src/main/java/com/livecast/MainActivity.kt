@@ -42,6 +42,17 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 class MainActivity : Activity() {
+    companion object {
+        private const val REQUEST_CAPTURE_PERMISSIONS = 1
+        private const val REQUEST_SCREEN_CAPTURE = 2
+        private const val REQUEST_STARTUP_PERMISSIONS = 3
+        private const val REQUEST_MICROPHONE_TOGGLE = 4
+
+        private var startupPermissionFlowStarted = false
+        private var pendingProjectionCode: Int? = null
+        private var pendingProjectionData: Intent? = null
+    }
+
     private lateinit var url: EditText
     private lateinit var streamKey: EditText
     private lateinit var ticker: EditText
@@ -70,6 +81,7 @@ class MainActivity : Activity() {
     private lateinit var chatDot: View
     private lateinit var streamStatus: TextView
     private lateinit var chatStatus: TextView
+    private lateinit var permissionStatus: TextView
     private lateinit var settingsPage: ScrollView
     private lateinit var livePage: LinearLayout
     private lateinit var pageHost: FrameLayout
@@ -145,6 +157,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        pendingMode = b?.getString("pending_mode") ?: "stream"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(18), dp(18), dp(18))
@@ -226,7 +239,7 @@ class MainActivity : Activity() {
                 ).apply { gravity = Gravity.CENTER }
             )
             previewHint = TextView(this@MainActivity).apply {
-                text = "Turn Preview on to select a screen or app."
+                text = "Microphone and notification permissions are checked at launch. Android requires screen-share consent for each capture session; camera and broad storage access are not used."
                 setTextColor(Color.parseColor("#DDE4EE"))
                 textSize = 12f
                 gravity = Gravity.CENTER
@@ -386,9 +399,23 @@ class MainActivity : Activity() {
             root.addView(this)
         }
         mic.setOnCheckedChangeListener { _, on ->
+            if (on && checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                mic.isChecked = false
+                requestPermissions(
+                    arrayOf(Manifest.permission.RECORD_AUDIO),
+                    REQUEST_MICROPHONE_TOGGLE
+                )
+                return@setOnCheckedChangeListener
+            }
             StreamService.micOn = on
             persistSettings()
-            if (StreamService.running) startService(Intent(this, StreamService::class.java).setAction("MIC"))
+            if (StreamService.running && StreamService.audioPrepared) {
+                startService(Intent(this, StreamService::class.java).setAction("MIC"))
+            } else if (on && StreamService.running) {
+                Toast.makeText(this, "Restart capture to enable microphone audio.", Toast.LENGTH_LONG).show()
+            }
         }
         preview = Switch(this).apply {
             text = "Preview"
@@ -407,7 +434,7 @@ class MainActivity : Activity() {
                 } else {
                     pendingMode = "preview"
                     previewHint.text = "Choose a screen or app to preview."
-                    requestScreenCapture()
+                    askPermissions()
                 }
             } else if (StreamService.previewOnly) {
                 startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
@@ -417,6 +444,9 @@ class MainActivity : Activity() {
                 previewHint.text = "Preview off."
             }
         }
+        permissionStatus = statusText("Permissions: checking at startup")
+        permissionStatus.textSize = 10f
+        root.addView(permissionStatus)
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             root.addView(this)
@@ -492,6 +522,12 @@ class MainActivity : Activity() {
         showPage(false)
         updateOverlayPreview()
         updateStatus()
+        beginStartupPermissionSetup()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("pending_mode", pendingMode)
+        super.onSaveInstanceState(outState)
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
@@ -511,6 +547,7 @@ class MainActivity : Activity() {
                     it === statusRow ||
                     it === previewCard ||
                     it === preview ||
+                    it === permissionStatus ||
                     it === actionRow ||
                     it === recordingStatus ||
                     it === openRecordingButton
@@ -534,6 +571,13 @@ class MainActivity : Activity() {
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply { topMargin = dp(6) }
+            )
+            addView(
+                permissionStatus,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(4) }
             )
             addView(
                 openRecordingButton,
@@ -995,7 +1039,10 @@ class MainActivity : Activity() {
             when {
                 StreamService.streamConnected -> Color.GREEN
                 StreamService.streamStatus == "Connecting" ||
-                    StreamService.streamStatus.startsWith("Waiting") -> Color.YELLOW
+                    StreamService.streamStatus.startsWith("Waiting") ||
+                    StreamService.streamStatus.startsWith("Checking") ||
+                    StreamService.streamStatus.startsWith("Allow screen") ||
+                    StreamService.streamStatus.startsWith("Permissions ready") -> Color.YELLOW
                 else -> Color.RED
             }
         )
@@ -1032,33 +1079,162 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun askPermissions() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+    private fun beginStartupPermissionSetup() {
+        if (startupPermissionFlowStarted || StreamService.running) return
+        startupPermissionFlowStarted = true
+        pendingMode = "startup"
+        StreamService.streamStatus = "Checking required permissions"
+        updatePermissionHint("not requested")
+        updateStatus()
+
+        val missingPermissions = mutableListOf<String>()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            missingPermissions.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            missingPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (missingPermissions.isEmpty()) {
+            requestStartupScreenCapture()
         } else {
+            requestPermissions(missingPermissions.toTypedArray(), REQUEST_STARTUP_PERMISSIONS)
+        }
+    }
+
+    private fun requestStartupScreenCapture() {
+        pendingMode = "startup"
+        StreamService.streamStatus = "Allow screen sharing when prompted"
+        updatePermissionHint("awaiting approval")
+        updateStatus()
+        requestScreenCapture()
+    }
+
+    private fun askPermissions() {
+        if (preview.isChecked && pendingMode == "preview") {
+            StreamService.previewEnabled = true
+        }
+        if (mic.isChecked &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                REQUEST_CAPTURE_PERMISSIONS
+            )
+        } else {
+            startCaptureWithAvailableConsent()
+        }
+    }
+
+    private fun startCaptureWithAvailableConsent() {
+        val code = pendingProjectionCode
+        val data = pendingProjectionData
+        if (code == null || data == null) {
+            StreamService.streamStatus = "Waiting for screen sharing permission"
+            updatePermissionHint("awaiting approval")
+            updateStatus()
             requestScreenCapture()
+            return
+        }
+        pendingProjectionCode = null
+        pendingProjectionData = null
+        startCaptureService(pendingMode, code, data)
+    }
+
+    private fun updatePermissionHint(screenShare: String) {
+        val microphone = if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            "granted"
+        } else {
+            "not granted (video-only)"
+        }
+        val notifications = if (Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            "granted"
+        } else {
+            "not granted (optional)"
+        }
+        permissionStatus.text =
+            "Microphone: $microphone | Notifications: $notifications | Screen share: $screenShare"
+    }
+
+    private fun requestScreenCapture() {
+        val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_SCREEN_CAPTURE)
+    }
+
+    private fun startCaptureService(mode: String, resultCode: Int, data: Intent) {
+        saveSettings()
+        val intent = Intent(this, StreamService::class.java)
+            .setAction(if (mode == "preview") "PREVIEW_START" else "START")
+            .putExtra("code", resultCode)
+            .putExtra("data", data)
+            .putExtra("mode", mode)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+            else startService(intent)
+        } catch (e: RuntimeException) {
+            val message = e.message ?: "check permissions"
+            if (mode == "record") {
+                StreamService.recordStatus = "Recording failed: $message"
+            } else {
+                StreamService.streamStatus = "Could not start capture: $message"
+            }
+            updateStatus()
         }
     }
 
     override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
         super.onRequestPermissionsResult(c, p, r)
-        if (c != 1) return
-        if (r.isEmpty() || r[0] != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            if (pendingMode == "record") {
-                StreamService.recordStatus = "Recording permission denied"
-            } else {
-                StreamService.streamStatus = "Microphone permission denied"
+        when (c) {
+            REQUEST_STARTUP_PERMISSIONS -> {
+                val microphoneGranted =
+                    checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                mic.isChecked = mic.isChecked && microphoneGranted
+                StreamService.micOn = mic.isChecked
+                val notificationsGranted = Build.VERSION.SDK_INT < 33 ||
+                    checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                previewHint.text = if (notificationsGranted) {
+                    "Microphone permission checked. Screen sharing consent is requested next."
+                } else {
+                    "Notifications are optional; screen capture and streaming can continue without them."
+                }
+                requestStartupScreenCapture()
             }
-            updateStatus()
-            Toast.makeText(this, "Allow microphone permission to start capture.", Toast.LENGTH_LONG).show()
-            return
+            REQUEST_MICROPHONE_TOGGLE -> {
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    mic.isChecked = true
+                } else {
+                    Toast.makeText(this, "Microphone permission was not granted.", Toast.LENGTH_LONG).show()
+                }
+            }
+            REQUEST_CAPTURE_PERMISSIONS -> {
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    mic.isChecked = false
+                    StreamService.micOn = false
+                    Toast.makeText(
+                        this,
+                        "Microphone denied. Continuing without microphone audio.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                startCaptureWithAvailableConsent()
+            }
         }
-        requestScreenCapture()
-    }
-
-    private fun requestScreenCapture() {
-        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        startActivityForResult(mpm.createScreenCaptureIntent(), 2)
     }
 
     override fun onStart() {
@@ -1092,7 +1268,21 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         super.onActivityResult(req, res, data)
-        if (req != 2) return
+        if (req != REQUEST_SCREEN_CAPTURE) return
+        if (pendingMode == "startup") {
+            if (res == RESULT_OK && data != null) {
+                pendingProjectionCode = res
+                pendingProjectionData = data
+                StreamService.streamStatus = "Permissions ready. Start live or recording when ready."
+                updatePermissionHint("ready; Android may ask again for a new session")
+            } else {
+                StreamService.streamStatus =
+                    "Screen sharing not allowed. Tap GO LIVE or RECORD to try again."
+                updatePermissionHint("denied; required for capture")
+            }
+            updateStatus()
+            return
+        }
         if (res != RESULT_OK || data == null) {
             if (pendingMode == "record") {
                 StreamService.recordStatus = "Recording cancelled"
@@ -1102,28 +1292,12 @@ class MainActivity : Activity() {
             } else {
                 "Screen capture permission cancelled"
             }
+            updatePermissionHint("not allowed")
             if (pendingMode == "preview") preview.isChecked = false
             updateStatus()
             return
         }
-        saveSettings()
-        val isPreview = pendingMode == "preview"
-        val i = Intent(this, StreamService::class.java)
-            .setAction(if (isPreview) "PREVIEW_START" else "START")
-            .putExtra("code", res)
-            .putExtra("data", data)
-            .putExtra("mode", pendingMode)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
-        } catch (e: RuntimeException) {
-            val message = e.message ?: "check permissions"
-            if (pendingMode == "record") {
-                StreamService.recordStatus = "Recording failed: $message"
-            } else {
-                StreamService.streamStatus = "Could not start service: $message"
-            }
-            updateStatus()
-        }
+        startCaptureService(pendingMode, res, data)
     }
 
     private fun attachPreview() {

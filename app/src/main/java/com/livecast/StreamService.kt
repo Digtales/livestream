@@ -35,6 +35,7 @@ class StreamService : Service(), ConnectChecker {
         var streamConnected = false
         @Volatile
         var recording = false
+        var audioPrepared = false
         var recordStatus = "Not recording"
         var recordingPath = ""
         var lastRecordingPath = ""
@@ -207,6 +208,7 @@ class StreamService : Service(), ConnectChecker {
 
     private fun stopPreviewCapture(status: String) {
         previewOnly = false
+        audioPrepared = false
         previewVirtualDisplay?.release()
         previewVirtualDisplay = null
         attachedPreviewSurface = null
@@ -226,21 +228,41 @@ class StreamService : Service(), ConnectChecker {
 
     private fun start(i: Intent) {
         if (running) return
+        audioPrepared = false
+        val microphonePermissionGranted =
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (!microphonePermissionGranted) micOn = false
         streamConnected = false
-        streamStatus = if (i.getStringExtra("mode") == "record") "Disconnected" else "Connecting"
+        streamStatus = when (i.getStringExtra("mode")) {
+            "record" -> "Disconnected"
+            "preview" -> "Screen preview starting"
+            else -> "Connecting"
+        }
         broadcastStatus()
         val ch = "live"
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(ch, "Live", NotificationManager.IMPORTANCE_LOW))
         val n = Notification.Builder(this, ch)
-            .setContentTitle(if (i.getStringExtra("mode") == "record") "Recording screen" else "Streaming live")
+            .setContentTitle(
+                when (i.getStringExtra("mode")) {
+                    "record" -> "Recording screen"
+                    "preview" -> "Screen preview active"
+                    else -> "Streaming live"
+                }
+            )
             .setSmallIcon(android.R.drawable.ic_media_play).build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val foregroundTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
+                (if (microphonePermissionGranted) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                } else {
+                    0
+                })
             startForeground(
                 1,
                 n,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                foregroundTypes
             )
         } else {
             startForeground(1, n)
@@ -273,10 +295,13 @@ class StreamService : Service(), ConnectChecker {
         ) {
             throw IllegalStateException("Could not prepare screen video encoder")
         }
-        if (!d.prepareAudio(128 * 1024, 44100, true)) {
-            throw IllegalStateException("Could not prepare microphone audio encoder. Check microphone permission.")
+        if (microphonePermissionGranted) {
+            if (!d.prepareAudio(128 * 1024, 44100, true)) {
+                throw IllegalStateException("Could not prepare microphone audio encoder.")
+            }
+            audioPrepared = true
+            if (!micOn) d.disableAudio()
         }
-        if (!micOn) d.disableAudio()
         display = d
         running = true
 
@@ -548,6 +573,7 @@ class StreamService : Service(), ConnectChecker {
         streamRequested = false
         streamConnected = false
         recording = false
+        audioPrepared = false
         chatConnected = false
         streamStatus = errorStatus ?: "Disconnected"
         broadcastStatus()
