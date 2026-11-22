@@ -708,8 +708,10 @@ class MainActivity : Activity() {
         try {
             service.updatePreview(previewSurface, previewWidth, previewHeight)
             previewHint.text = when {
-                StreamService.previewOnly -> "Previewing the selected screen or app."
-                StreamService.running -> "Live capture preview."
+                StreamService.previewOnly ->
+                    "Previewing the selected screen or app. Protected apps may show black by design."
+                StreamService.running ->
+                    "Live capture preview. Android may hide content from apps that block screen capture."
                 else -> "Preview will appear after capture starts."
             }
         } catch (e: RuntimeException) {

@@ -6,6 +6,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.MediaMetadataRetriever
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
@@ -31,6 +32,7 @@ class StreamService : Service(), ConnectChecker {
         var previewEnabled = false
         var streamRequested = false
         var streamConnected = false
+        @Volatile
         var recording = false
         var recordStatus = "Not recording"
         var recordingPath = ""
@@ -56,7 +58,14 @@ class StreamService : Service(), ConnectChecker {
     private var previewProjection: MediaProjection? = null
     private var previewVirtualDisplay: VirtualDisplay? = null
     private var projectionCallback: MediaProjection.Callback? = null
+    @Volatile private var recordingRequestedAtMs = 0L
+    @Volatile private var recordingStartedAtMs = 0L
+    @Volatile private var recordStopRequested = false
+    @Volatile private var stopServiceAfterRecording = false
+    private var stopServiceStatus: String? = null
     private val binder = LocalBinder()
+    private val minimumRecordDurationMs = 1_000L
+    private val recordStartTimeoutMs = 10_000L
 
     override fun onBind(i: Intent?) = binder
 
@@ -299,11 +308,7 @@ class StreamService : Service(), ConnectChecker {
     private fun toggleRecord() {
         val d = display ?: return
         if (d.isRecording) {
-            d.stopRecord()
-            recording = false
-            recordStatus = "Saved in Android/data/com.livecast/files/Movies: ${File(recordingPath).name}"
-            broadcastStatus()
-            if (!d.isStreaming) stop()
+            requestStopRecording(d)
             return
         }
         val directory = getExternalFilesDir(android.os.Environment.DIRECTORY_MOVIES)
@@ -313,18 +318,52 @@ class StreamService : Service(), ConnectChecker {
         }
         val file = File(directory, "LiveCast_${System.currentTimeMillis()}.mp4")
         recordingPath = file.absolutePath
-        recordStatus = "Starting recording..."
+        recordingRequestedAtMs = SystemClock.elapsedRealtime()
+        recordingStartedAtMs = 0L
+        recordStopRequested = false
+        stopServiceAfterRecording = false
+        stopServiceStatus = null
+        recordStatus = "Preparing recording..."
+        recording = true
+        broadcastStatus()
         d.startRecord(file.absolutePath, object : RecordController.Listener {
             override fun onStatusChange(status: RecordController.Status) {
                 when (status) {
-                    RecordController.Status.RECORDING, RecordController.Status.RESUMED -> {
+                    RecordController.Status.STARTED -> {
                         recording = true
-                        recordStatus = "Recording: ${file.name}"
+                        recordStatus = "Waiting for the first captured frame..."
+                    }
+                    RecordController.Status.RECORDING, RecordController.Status.RESUMED -> {
+                        if (recordingStartedAtMs == 0L) {
+                            recordingStartedAtMs = SystemClock.elapsedRealtime()
+                        }
+                        recording = true
+                        recordStatus = if (recordStopRequested) {
+                            "Finalizing recording..."
+                        } else {
+                            "Recording: ${file.name}"
+                        }
+                        if (recordStopRequested) finishRecordingWhenReady(d)
                     }
                     RecordController.Status.STOPPED -> {
                         recording = false
-                        recordStatus = "Saved in Android/data/com.livecast/files/Movies: ${file.name}"
-                        persistRecording(file)
+                        recordingStartedAtMs = 0L
+                        val validationError = validateRecording(file)
+                        if (validationError == null && !recordStatus.startsWith("Recording failed:")) {
+                            recordStatus = "Saved: ${file.name}"
+                            persistRecording(file)
+                        } else {
+                            recordStatus = "Recording failed: ${
+                                validationError ?: recordStatus.removePrefix("Recording failed:").trim()
+                            }"
+                        }
+                        val stopService = stopServiceAfterRecording
+                        val finalStatus = stopServiceStatus
+                        recordStopRequested = false
+                        recordingRequestedAtMs = 0L
+                        stopServiceAfterRecording = false
+                        stopServiceStatus = null
+                        if (stopService) handler.post { stop(finalStatus) }
                     }
 
                     else -> Unit
@@ -333,14 +372,86 @@ class StreamService : Service(), ConnectChecker {
             }
 
             override fun onError(e: Exception) {
-                recording = false
+                recording = d.isRecording
                 recordStatus = "Recording failed: ${e.message ?: "write error"}"
+                if (!d.isStreaming) stopServiceAfterRecording = true
+                recordStopRequested = true
+                finishRecordingWhenReady(d)
                 broadcastStatus()
             }
         })
-        recording = true
-        recordStatus = "Recording: ${file.name}"
+        handler.postDelayed({
+            if (display === d && d.isRecording && recordingStartedAtMs == 0L) {
+                recordStatus = "Recording failed: no video frames arrived from screen capture."
+                recordStopRequested = true
+                if (!d.isStreaming) stopServiceAfterRecording = true
+                broadcastStatus()
+                finishRecordingWhenReady(d)
+            }
+        }, recordStartTimeoutMs)
+    }
+
+    private fun requestStopRecording(d: RtmpDisplay) {
+        if (recordStopRequested) return
+        recordStopRequested = true
+        if (!d.isStreaming) stopServiceAfterRecording = true
+        if (!recordStatus.startsWith("Recording failed:")) {
+            recordStatus = "Finalizing recording..."
+        }
         broadcastStatus()
+        finishRecordingWhenReady(d)
+    }
+
+    private fun finishRecordingWhenReady(d: RtmpDisplay) {
+        if (display !== d || !d.isRecording) return
+        val now = SystemClock.elapsedRealtime()
+        val startedAt = recordingStartedAtMs
+        if (startedAt == 0L) {
+            val waitMs = recordStartTimeoutMs - (now - recordingRequestedAtMs)
+            if (waitMs > 0) {
+                handler.postDelayed({ finishRecordingWhenReady(d) }, minOf(waitMs, 250L))
+                return
+            }
+        } else {
+            val waitMs = minimumRecordDurationMs - (now - startedAt)
+            if (waitMs > 0) {
+                handler.postDelayed({ finishRecordingWhenReady(d) }, waitMs)
+                return
+            }
+        }
+        handler.post {
+            if (display === d && d.isRecording) d.stopRecord()
+        }
+    }
+
+    private fun validateRecording(file: File): String? {
+        if (!file.isFile || file.length() < 1_024L) {
+            return "The MP4 is empty or too short to be playable."
+        }
+        val retriever = MediaMetadataRetriever()
+        var validationError: String? = null
+        try {
+            retriever.setDataSource(file.absolutePath)
+            val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            val hasVideo = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO)
+                .equals("yes", ignoreCase = true)
+            if (duration <= 0L || !hasVideo) {
+                validationError = "The finalized MP4 has no readable video track."
+            }
+        } catch (e: IllegalArgumentException) {
+            validationError = "Android could not read the finalized MP4: ${e.message ?: "invalid file"}"
+        } catch (e: RuntimeException) {
+            validationError = "Android could not verify the finalized MP4: ${e.message ?: "invalid file"}"
+        }
+        try {
+            retriever.release()
+        } catch (e: RuntimeException) {
+            if (validationError == null) {
+                validationError = "Could not release the video validator: ${e.message ?: "unknown error"}"
+            }
+        }
+        return validationError
     }
 
     private fun persistRecording(file: File) {
@@ -400,6 +511,18 @@ class StreamService : Service(), ConnectChecker {
     private fun stop(errorStatus: String? = null) {
         if (previewOnly) {
             stopPreviewCapture(errorStatus ?: "Preview stopped")
+            return
+        }
+        val activeDisplay = display
+        if (activeDisplay?.isRecording == true) {
+            stopServiceAfterRecording = true
+            stopServiceStatus = errorStatus
+            streamRequested = false
+            streamConnected = false
+            if (activeDisplay.isStreaming) activeDisplay.stopStream()
+            requestStopRecording(activeDisplay)
+            streamStatus = errorStatus ?: "Finalizing recording..."
+            broadcastStatus()
             return
         }
         running = false
