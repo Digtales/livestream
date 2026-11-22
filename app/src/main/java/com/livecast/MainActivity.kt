@@ -10,11 +10,14 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
 import android.widget.*
+import java.net.InetSocketAddress
+import java.net.Socket
 
 class MainActivity : Activity() {
     private lateinit var url: EditText
@@ -26,11 +29,20 @@ class MainActivity : Activity() {
     private lateinit var mic: Switch
     private lateinit var preview: Switch
     private lateinit var btn: Button
+    private lateinit var recordBtn: Button
+    private lateinit var connectBtn: Button
+    private lateinit var destinationStatus: TextView
+    private lateinit var tickerPosition: RadioGroup
+    private lateinit var tickerFont: Spinner
+    private lateinit var tickerSize: SeekBar
+    private lateinit var tickerSizeLabel: TextView
+    private lateinit var tickerColor: Spinner
     private lateinit var previewCard: LinearLayout
     private lateinit var streamDot: View
     private lateinit var chatDot: View
     private lateinit var streamStatus: TextView
     private lateinit var chatStatus: TextView
+    private var pendingMode = "stream"
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -92,8 +104,64 @@ class MainActivity : Activity() {
 
         root.addView(label("Destination"))
         url = et("RTMP URL + stream key")
+        connectBtn = Button(this).apply {
+            text = "CONNECT"
+            setAllCaps(false)
+            root.addView(this)
+        }
+        destinationStatus = statusText("Paste an RTMP URL to check the server")
+        destinationStatus.setPadding(0, dp(4), 0, dp(4))
+        root.addView(destinationStatus)
+        connectBtn.setOnClickListener { checkDestination() }
+
         root.addView(label("Scrolling ticker"))
         ticker = et("Ticker text")
+        root.addView(label("Ticker position"))
+        tickerPosition = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            listOf("Top", "Bottom").forEachIndexed { index, text ->
+                addView(RadioButton(context).apply {
+                    this.text = text
+                    id = 10 + index
+                    setTextColor(Color.WHITE)
+                })
+            }
+            check(11)
+            root.addView(this)
+        }
+        root.addView(label("Ticker font"))
+        tickerFont = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf("Sans", "Sans bold", "Serif", "Monospace")
+            )
+            root.addView(this)
+        }
+        root.addView(label("Ticker size"))
+        tickerSizeLabel = statusText("24 px")
+        root.addView(tickerSizeLabel)
+        tickerSize = SeekBar(this).apply {
+            max = 28
+            progress = 10
+            root.addView(this)
+        }
+        tickerSize.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                tickerSizeLabel.text = "${progress + 14} px"
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        root.addView(label("Ticker color"))
+        tickerColor = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf("White", "Yellow", "Red", "Cyan", "Green")
+            )
+            root.addView(this)
+        }
         root.addView(label("Platform"))
         platform = RadioGroup(this).apply {
             orientation = RadioGroup.HORIZONTAL
@@ -146,24 +214,33 @@ class MainActivity : Activity() {
                 startService(Intent(this, StreamService::class.java).setAction("PREVIEW"))
             }
         }
-        btn = Button(this).apply {
-            text = "GO LIVE"
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
-            setAllCaps(false)
-            setPadding(0, dp(12), 0, dp(12))
-            background = rounded("#E11D48")
+        val actionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             root.addView(this)
         }
+        btn = actionButton("STREAM", "#E11D48").also { actionRow.addView(it, weightedButtonParams()) }
+        recordBtn = actionButton("RECORD", "#2563EB").also { actionRow.addView(it, weightedButtonParams()) }
         btn.setOnClickListener {
-            if (StreamService.running) {
-                startService(Intent(this, StreamService::class.java).setAction("STOP"))
-                btn.text = "GO LIVE"
-            } else if (url.text.trim().isEmpty()) {
-                url.error = "RTMP URL + stream key required"
-            } else {
+            saveSettings()
+            if (StreamService.streamConnected || StreamService.streamStatus == "Connecting") {
+                startService(Intent(this, StreamService::class.java).setAction("STOP_STREAM"))
+            } else if (!StreamService.running) {
+                if (!validRtmpUrl()) return@setOnClickListener
+                pendingMode = "stream"
                 askPermissions()
+            } else {
+                startService(Intent(this, StreamService::class.java).setAction("STREAM"))
+            }
+        }
+        recordBtn.setOnClickListener {
+            saveSettings()
+            if (StreamService.recording) {
+                startService(Intent(this, StreamService::class.java).setAction("RECORD"))
+            } else if (!StreamService.running) {
+                pendingMode = "record"
+                askPermissions()
+            } else {
+                startService(Intent(this, StreamService::class.java).setAction("RECORD"))
             }
         }
         setContentView(ScrollView(this).apply { addView(root) })
@@ -203,9 +280,99 @@ class MainActivity : Activity() {
         addView(text)
     }
 
+    private fun actionButton(text: String, color: String) = Button(this).apply {
+        this.text = text
+        setTextColor(Color.WHITE)
+        textSize = 15f
+        typeface = Typeface.DEFAULT_BOLD
+        setAllCaps(false)
+        setPadding(dp(4), dp(12), dp(4), dp(12))
+        background = rounded(color)
+    }
+
+    private fun weightedButtonParams() = LinearLayout.LayoutParams(
+        0,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+        1f
+    ).apply { marginEnd = dp(6) }
+
+    private fun validRtmpUrl(): Boolean {
+        val value = url.text.toString().trim()
+        val uri = Uri.parse(value)
+        if (!listOf("rtmp", "rtmps").any { it.equals(uri.scheme, ignoreCase = true) } || uri.host.isNullOrBlank()) {
+            url.error = "Enter a valid rtmp:// or rtmps:// server URL and stream key"
+            return false
+        }
+        return true
+    }
+
+    private fun checkDestination() {
+        if (!validRtmpUrl()) return
+        val uri = Uri.parse(url.text.toString().trim())
+        val port = if (uri.port > 0) uri.port else if (uri.scheme.equals("rtmps", ignoreCase = true)) 443 else 1935
+        val host = uri.host ?: return
+        connectBtn.isEnabled = false
+        destinationStatus.text = "Checking $host:$port..."
+        destinationStatus.setTextColor(Color.YELLOW)
+        Thread {
+            val result = try {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(host, port), 5000)
+                }
+                "Server reachable. Tap STREAM to start sending video."
+            } catch (e: java.io.IOException) {
+                "Server check failed: ${e.message ?: "connection refused"}"
+            }
+            runOnUiThread {
+                connectBtn.isEnabled = true
+                destinationStatus.text = result
+                destinationStatus.setTextColor(
+                    if (result.startsWith("Server reachable")) Color.GREEN else Color.RED
+                )
+            }
+        }.start()
+    }
+
+    private fun saveSettings() {
+        StreamService.apply {
+            platform = when (this@MainActivity.platform.checkedRadioButtonId) {
+                1 -> "yt"
+                2 -> "fb"
+                else -> "rtmp"
+            }
+            rtmpUrl = this@MainActivity.url.text.toString().trim()
+            tickerText = this@MainActivity.ticker.text.toString()
+            chatSource = when (this@MainActivity.platform.checkedRadioButtonId) {
+                1 -> "yt"
+                2 -> "fb"
+                else -> ""
+            }
+            chatTarget = this@MainActivity.chatId.text.toString().trim()
+            chatToken = this@MainActivity.token.text.toString().trim()
+            landscape = this@MainActivity.orient.checkedRadioButtonId == 2
+            micOn = this@MainActivity.mic.isChecked
+            tickerPosition = if (this@MainActivity.tickerPosition.checkedRadioButtonId == 10) "top" else "bottom"
+            tickerFont = this@MainActivity.tickerFont.selectedItem.toString()
+            tickerTextSize = this@MainActivity.tickerSize.progress + 14
+            tickerColor = when (this@MainActivity.tickerColor.selectedItemPosition) {
+                1 -> Color.YELLOW
+                2 -> Color.RED
+                3 -> Color.CYAN
+                4 -> Color.GREEN
+                else -> Color.WHITE
+            }
+        }
+    }
+
     private fun updateStatus() {
         setDot(streamDot, if (StreamService.streamConnected) Color.GREEN else Color.RED)
         streamStatus.text = StreamService.streamStatus
+        btn.text = when {
+            StreamService.streamConnected -> "STOP STREAM"
+            StreamService.streamStatus == "Connecting" -> "CONNECTING..."
+            else -> "STREAM"
+        }
+        recordBtn.text = if (StreamService.recording) "STOP RECORDING" else "RECORD"
         val chatEnabled = chatId.text.toString().trim().isNotEmpty() &&
             platform.checkedRadioButtonId != 3
         setDot(chatDot, if (StreamService.chatConnected) Color.GREEN else if (chatEnabled) Color.RED else Color.GRAY)
@@ -251,23 +418,11 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         if (req != 2 || res != RESULT_OK || data == null) return
-        StreamService.apply {
-            platform = when (this@MainActivity.platform.checkedRadioButtonId) {
-                1 -> "yt"
-                2 -> "fb"
-                else -> "rtmp"
-            }
-            rtmpUrl = url.text.toString().trim()
-            tickerText = ticker.text.toString()
-            chatSource = when (this@MainActivity.platform.checkedRadioButtonId) { 1 -> "yt"; 2 -> "fb"; else -> "" }
-            chatTarget = chatId.text.toString().trim()
-            chatToken = token.text.toString().trim()
-            landscape = orient.checkedRadioButtonId == 2
-            micOn = mic.isChecked
-        }
+        saveSettings()
         val i = Intent(this, StreamService::class.java).setAction("START")
-            .putExtra("code", res).putExtra("data", data)
+            .putExtra("code", res)
+            .putExtra("data", data)
+            .putExtra("mode", pendingMode)
         startForegroundService(i)
-        btn.text = "STOP"
     }
 }
