@@ -33,6 +33,7 @@ class StreamService : Service(), ConnectChecker {
         var previewEnabled = false
         var streamRequested = false
         var streamConnected = false
+        var previewReady = false
         @Volatile
         var recording = false
         var audioPrepared = false
@@ -58,6 +59,8 @@ class StreamService : Service(), ConnectChecker {
     private var poller: ChatPoller? = null
     private var scrollX = 0f
     private var attachedPreviewSurface: Surface? = null
+    private var requestedPreviewSurface: Surface? = null
+    private var previewAttachRunnable: Runnable? = null
     private var previewProjection: MediaProjection? = null
     private var previewVirtualDisplay: VirtualDisplay? = null
     private var projectionCallback: MediaProjection.Callback? = null
@@ -127,31 +130,36 @@ class StreamService : Service(), ConnectChecker {
         val d = display ?: return
         val gl = d.glInterface as? GlStreamInterface ?: return
         if (!previewEnabled || surface == null) {
+            previewAttachRunnable?.let(handler::removeCallbacks)
+            previewAttachRunnable = null
+            requestedPreviewSurface = null
             gl.deAttachPreview()
             attachedPreviewSurface = null
+            previewReady = false
             return
         }
         if (width <= 0 || height <= 0) return
-        try {
-            gl.setPreviewResolution(width, height)
-            if (attachedPreviewSurface !== surface) {
-                gl.attachPreview(surface)
-                attachedPreviewSurface = surface
-            }
-        } catch (e: RuntimeException) {
-            streamStatus = "Preview error: ${e.message ?: "surface is unavailable"}"
-            broadcastStatus()
-            throw e
+        requestedPreviewSurface = surface
+        gl.setPreviewResolution(width, height)
+        if (attachedPreviewSurface === surface && gl.isRunning()) {
+            previewReady = true
+            return
         }
+        if (gl.isRunning()) attachPreviewToGl(gl, surface)
+        else schedulePreviewAttach(gl, surface)
     }
 
     private fun updateScreenPreview(surface: Surface?, width: Int, height: Int) {
         if (surface == null || !previewEnabled) {
             previewVirtualDisplay?.setSurface(null)
             attachedPreviewSurface = null
+            previewReady = false
             return
         }
-        val projection = previewProjection ?: return
+        val projection = previewProjection ?: run {
+            previewReady = false
+            return
+        }
         if (width <= 0 || height <= 0) return
         val densityDpi = resources.displayMetrics.densityDpi
         if (previewVirtualDisplay == null) {
@@ -170,10 +178,54 @@ class StreamService : Service(), ConnectChecker {
             previewVirtualDisplay?.setSurface(surface)
         }
         attachedPreviewSurface = surface
+        previewReady = true
+    }
+
+    private fun schedulePreviewAttach(
+        gl: GlStreamInterface,
+        surface: Surface
+    ) {
+        previewAttachRunnable?.let(handler::removeCallbacks)
+        var attempts = 0
+        val attachTask = object : Runnable {
+            override fun run() {
+                if (!running || !previewEnabled || requestedPreviewSurface !== surface || !surface.isValid) {
+                    previewAttachRunnable = null
+                    return
+                }
+                if (gl.isRunning()) {
+                    attachPreviewToGl(gl, surface)
+                    previewAttachRunnable = null
+                } else if (++attempts < 40) {
+                    handler.postDelayed(this, 50)
+                } else {
+                    previewReady = false
+                    streamStatus = "Preview unavailable: video renderer did not start"
+                    previewAttachRunnable = null
+                    broadcastStatus()
+                }
+            }
+        }
+        previewAttachRunnable = attachTask
+        handler.post(attachTask)
+    }
+
+    private fun attachPreviewToGl(gl: GlStreamInterface, surface: Surface) {
+        try {
+            gl.attachPreview(surface)
+            attachedPreviewSurface = surface
+            previewReady = true
+            broadcastStatus()
+        } catch (e: RuntimeException) {
+            previewReady = false
+            streamStatus = "Preview error: ${e.message ?: "surface is unavailable"}"
+            broadcastStatus()
+        }
     }
 
     private fun startPreviewCapture(i: Intent) {
         if (running) return
+        previewReady = false
         val data = i.getParcelableExtra<Intent>("data")
             ?: throw IllegalArgumentException("Screen capture permission was not provided")
         val channel = "live"
@@ -209,9 +261,11 @@ class StreamService : Service(), ConnectChecker {
     private fun stopPreviewCapture(status: String) {
         previewOnly = false
         audioPrepared = false
+        previewReady = false
         previewVirtualDisplay?.release()
         previewVirtualDisplay = null
         attachedPreviewSurface = null
+        requestedPreviewSurface = null
         projectionCallback?.let { callback ->
             previewProjection?.unregisterCallback(callback)
         }
@@ -229,6 +283,11 @@ class StreamService : Service(), ConnectChecker {
     private fun start(i: Intent) {
         if (running) return
         audioPrepared = false
+        previewReady = false
+        attachedPreviewSurface = null
+        requestedPreviewSurface = null
+        previewAttachRunnable?.let(handler::removeCallbacks)
+        previewAttachRunnable = null
         val microphonePermissionGranted =
             checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
                 android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -574,6 +633,11 @@ class StreamService : Service(), ConnectChecker {
         streamConnected = false
         recording = false
         audioPrepared = false
+        previewReady = false
+        previewAttachRunnable?.let(handler::removeCallbacks)
+        previewAttachRunnable = null
+        attachedPreviewSurface = null
+        requestedPreviewSurface = null
         chatConnected = false
         streamStatus = errorStatus ?: "Disconnected"
         broadcastStatus()
