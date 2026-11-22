@@ -22,6 +22,12 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.widget.*
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import androidx.core.content.FileProvider
+import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -47,7 +53,9 @@ class MainActivity : Activity() {
     private lateinit var tickerSizeLabel: TextView
     private lateinit var tickerColor: Spinner
     private lateinit var previewCard: LinearLayout
+    private lateinit var previewFrame: FrameLayout
     private lateinit var previewView: SurfaceView
+    private lateinit var overlayPreview: TextView
     private lateinit var previewHint: TextView
     private lateinit var streamDot: View
     private lateinit var chatDot: View
@@ -138,16 +146,38 @@ class MainActivity : Activity() {
         previewCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = rounded("#0B0F16")
+            previewFrame = FrameLayout(this@MainActivity)
             previewView = SurfaceView(this@MainActivity).apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
                     dp(210)
                 )
                 holder.addCallback(previewCallback)
             }
-            addView(previewView)
+            previewFrame.addView(previewView)
+            overlayPreview = TextView(this@MainActivity).apply {
+                text = "Ticker preview"
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.argb(210, 0, 0, 0))
+                textSize = 24f
+                setSingleLine(true)
+                ellipsize = android.text.TextUtils.TruncateAt.MARQUEE
+                marqueeRepeatLimit = -1
+                isSelected = true
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), dp(6), dp(8), dp(6))
+            }
+            previewFrame.addView(
+                overlayPreview,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.BOTTOM
+                )
+            )
+            addView(previewFrame)
             previewHint = TextView(this@MainActivity).apply {
-                text = "Preview will appear here after screen capture starts."
+                text = "Turn Preview on to select a screen or app."
                 setTextColor(Color.parseColor("#DDE4EE"))
                 textSize = 12f
                 gravity = Gravity.CENTER
@@ -162,6 +192,12 @@ class MainActivity : Activity() {
         streamKey = et("Stream key (optional if already included in URL)")
         streamKey.inputType = android.text.InputType.TYPE_CLASS_TEXT or
             android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        root.addView(TextView(this).apply {
+            text = "For YouTube, copy your private stream key from YouTube Studio > Live Control Room > Stream settings. Keep it secret."
+            setTextColor(Color.parseColor("#AAB3C2"))
+            textSize = 12f
+            setPadding(0, dp(4), 0, dp(8))
+        })
         connectBtn = Button(this).apply {
             text = "CONNECT"
             setAllCaps(false)
@@ -181,6 +217,13 @@ class MainActivity : Activity() {
 
         root.addView(label("Scrolling ticker"))
         ticker = et("Ticker text")
+        ticker.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                updateOverlayPreview()
+            }
+            override fun afterTextChanged(s: Editable?) {}
+        })
         root.addView(label("Ticker position"))
         tickerPosition = RadioGroup(this).apply {
             orientation = RadioGroup.HORIZONTAL
@@ -192,6 +235,7 @@ class MainActivity : Activity() {
                 })
             }
             check(11)
+            setOnCheckedChangeListener { _, _ -> updateOverlayPreview() }
             root.addView(this)
         }
         root.addView(label("Ticker font"))
@@ -202,6 +246,12 @@ class MainActivity : Activity() {
                 listOf("Sans", "Sans bold", "Serif", "Monospace")
             )
             root.addView(this)
+        }
+        tickerFont.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                updateOverlayPreview()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
         root.addView(label("Ticker size"))
         tickerSizeLabel = statusText("24 px")
@@ -214,6 +264,7 @@ class MainActivity : Activity() {
         tickerSize.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 tickerSizeLabel.text = "${progress + 14} px"
+                updateOverlayPreview()
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
@@ -226,6 +277,12 @@ class MainActivity : Activity() {
                 listOf("White", "Yellow", "Red", "Cyan", "Green")
             )
             root.addView(this)
+        }
+        tickerColor.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                updateOverlayPreview()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
         root.addView(label("Platform"))
         platform = RadioGroup(this).apply {
@@ -274,8 +331,23 @@ class MainActivity : Activity() {
         }
         preview.setOnCheckedChangeListener { _, on ->
             StreamService.previewEnabled = on
-            previewCard.visibility = if (on) View.VISIBLE else View.GONE
-            if (!on) streamService?.updatePreview(null, 0, 0) else attachPreview()
+            if (on) {
+                saveSettings()
+                if (StreamService.running) {
+                    previewHint.text = "Starting preview..."
+                    attachPreview()
+                } else {
+                    pendingMode = "preview"
+                    previewHint.text = "Choose a screen or app to preview."
+                    requestScreenCapture()
+                }
+            } else if (StreamService.previewOnly) {
+                startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
+                previewHint.text = "Preview stopped."
+            } else {
+                streamService?.updatePreview(null, 0, 0)
+                previewHint.text = "Preview off."
+            }
         }
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -290,6 +362,11 @@ class MainActivity : Activity() {
             saveSettings()
             if (StreamService.streamConnected || StreamService.streamStatus == "Connecting") {
                 startService(Intent(this, StreamService::class.java).setAction("STOP_STREAM"))
+            } else if (StreamService.previewOnly) {
+                startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
+                if (!validRtmpUrl()) return@setOnClickListener
+                pendingMode = "stream"
+                askPermissions()
             } else if (!StreamService.running) {
                 if (!validRtmpUrl()) return@setOnClickListener
                 pendingMode = "stream"
@@ -302,6 +379,10 @@ class MainActivity : Activity() {
             saveSettings()
             if (StreamService.recording) {
                 startService(Intent(this, StreamService::class.java).setAction("RECORD"))
+            } else if (StreamService.previewOnly) {
+                startService(Intent(this, StreamService::class.java).setAction("PREVIEW_STOP"))
+                pendingMode = "record"
+                askPermissions()
             } else if (!StreamService.running) {
                 pendingMode = "record"
                 askPermissions()
@@ -309,7 +390,11 @@ class MainActivity : Activity() {
                 startService(Intent(this, StreamService::class.java).setAction("RECORD"))
             }
         }
+        val openRecordingButton = actionButton("OPEN LAST RECORDING", "#334155")
+        root.addView(openRecordingButton)
+        openRecordingButton.setOnClickListener { openLastRecording() }
         setContentView(ScrollView(this).apply { addView(root) })
+        updateOverlayPreview()
         updateStatus()
     }
 
@@ -440,6 +525,68 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updateOverlayPreview() {
+        if (!::overlayPreview.isInitialized ||
+            !::ticker.isInitialized ||
+            !::tickerPosition.isInitialized ||
+            !::tickerFont.isInitialized ||
+            !::tickerSize.isInitialized ||
+            !::tickerColor.isInitialized
+        ) return
+        val text = ticker.text.toString()
+        StreamService.tickerText = text
+        StreamService.tickerPosition =
+            if (tickerPosition.checkedRadioButtonId == 10) "top" else "bottom"
+        StreamService.tickerFont = tickerFont.selectedItem?.toString() ?: "Sans"
+        StreamService.tickerTextSize = tickerSize.progress + 14
+        StreamService.tickerColor = when (tickerColor.selectedItemPosition) {
+            1 -> Color.YELLOW
+            2 -> Color.RED
+            3 -> Color.CYAN
+            4 -> Color.GREEN
+            else -> Color.WHITE
+        }
+        overlayPreview.text = text.ifBlank { "Ticker preview" }
+        overlayPreview.setTextColor(StreamService.tickerColor)
+        overlayPreview.textSize = StreamService.tickerTextSize.toFloat()
+        overlayPreview.typeface = when (StreamService.tickerFont) {
+            "Serif" -> Typeface.create(Typeface.SERIF, Typeface.NORMAL)
+            "Monospace" -> Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
+            "Sans bold" -> Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            else -> Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+        }
+        val gravity = if (StreamService.tickerPosition == "top") Gravity.TOP else Gravity.BOTTOM
+        (overlayPreview.layoutParams as? FrameLayout.LayoutParams)?.let { params ->
+            params.gravity = gravity
+            overlayPreview.layoutParams = params
+        }
+    }
+
+    private fun openLastRecording() {
+        val path = getSharedPreferences("livecast", MODE_PRIVATE)
+            .getString("last_recording_path", StreamService.lastRecordingPath)
+        if (path.isNullOrBlank()) {
+            Toast.makeText(this, "No saved recording yet.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val file = File(path)
+        if (!file.isFile) {
+            Toast.makeText(this, "Recording file not found.", Toast.LENGTH_LONG).show()
+            return
+        }
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+            val intent = Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, "video/mp4")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(intent)
+        } catch (_: android.content.ActivityNotFoundException) {
+            Toast.makeText(this, "No video player is installed.", Toast.LENGTH_LONG).show()
+        } catch (e: IllegalArgumentException) {
+            Toast.makeText(this, "Cannot open recording: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private fun updateStatus() {
         setDot(
             streamDot,
@@ -531,12 +678,19 @@ class MainActivity : Activity() {
         super.onActivityResult(req, res, data)
         if (req != 2) return
         if (res != RESULT_OK || data == null) {
-            StreamService.streamStatus = "Screen capture permission cancelled"
+            StreamService.streamStatus = if (pendingMode == "preview") {
+                "Preview permission cancelled"
+            } else {
+                "Screen capture permission cancelled"
+            }
+            if (pendingMode == "preview") preview.isChecked = false
             updateStatus()
             return
         }
         saveSettings()
-        val i = Intent(this, StreamService::class.java).setAction("START")
+        val isPreview = pendingMode == "preview"
+        val i = Intent(this, StreamService::class.java)
+            .setAction(if (isPreview) "PREVIEW_START" else "START")
             .putExtra("code", res)
             .putExtra("data", data)
             .putExtra("mode", pendingMode)
@@ -553,7 +707,11 @@ class MainActivity : Activity() {
         val service = streamService ?: return
         try {
             service.updatePreview(previewSurface, previewWidth, previewHeight)
-            previewHint.text = if (StreamService.running) "Screen capture preview" else "Preview will appear after capture starts."
+            previewHint.text = when {
+                StreamService.previewOnly -> "Previewing the selected screen or app."
+                StreamService.running -> "Live capture preview."
+                else -> "Preview will appear after capture starts."
+            }
         } catch (e: RuntimeException) {
             previewHint.text = "Preview error: ${e.message ?: "surface is unavailable"}"
             StreamService.streamStatus = "Preview error: ${e.message ?: "surface is unavailable"}"

@@ -4,6 +4,10 @@ import android.app.*
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.*
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.view.Surface
 import com.pedro.common.ConnectChecker
@@ -23,12 +27,14 @@ class StreamService : Service(), ConnectChecker {
     companion object {
         const val STATUS_ACTION = "com.livecast.STATUS"
         var running = false
-        var previewEnabled = true
+        var previewOnly = false
+        var previewEnabled = false
         var streamRequested = false
         var streamConnected = false
         var recording = false
         var recordStatus = "Not recording"
         var recordingPath = ""
+        var lastRecordingPath = ""
         var chatConnected = false
         var streamStatus = "Disconnected"
         var platform = ""
@@ -47,14 +53,34 @@ class StreamService : Service(), ConnectChecker {
     private var poller: ChatPoller? = null
     private var scrollX = 0f
     private var attachedPreviewSurface: Surface? = null
+    private var previewProjection: MediaProjection? = null
+    private var previewVirtualDisplay: VirtualDisplay? = null
+    private var projectionCallback: MediaProjection.Callback? = null
     private val binder = LocalBinder()
 
     override fun onBind(i: Intent?) = binder
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        if (previewOnly) {
+            previewOnly = false
+            running = false
+            previewVirtualDisplay?.release()
+            previewVirtualDisplay = null
+            projectionCallback?.let { previewProjection?.unregisterCallback(it) }
+            projectionCallback = null
+            previewProjection?.stop()
+            previewProjection = null
+        }
+        super.onDestroy()
+    }
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
         try {
             when (i?.action) {
                 "START" -> start(i)
+                "PREVIEW_START" -> startPreviewCapture(i)
+                "PREVIEW_STOP" -> stopPreviewCapture("Preview stopped")
                 "STREAM" -> startStream()
                 "STOP_STREAM" -> stopStream()
                 "RECORD" -> toggleRecord()
@@ -82,6 +108,10 @@ class StreamService : Service(), ConnectChecker {
     }
 
     fun updatePreview(surface: Surface?, width: Int, height: Int) {
+        if (previewOnly) {
+            updateScreenPreview(surface, width, height)
+            return
+        }
         val d = display ?: return
         val gl = d.glInterface as? GlStreamInterface ?: return
         if (!previewEnabled || surface == null) {
@@ -103,6 +133,86 @@ class StreamService : Service(), ConnectChecker {
         }
     }
 
+    private fun updateScreenPreview(surface: Surface?, width: Int, height: Int) {
+        if (surface == null || !previewEnabled) {
+            previewVirtualDisplay?.setSurface(null)
+            attachedPreviewSurface = null
+            return
+        }
+        val projection = previewProjection ?: return
+        if (width <= 0 || height <= 0) return
+        val densityDpi = resources.displayMetrics.densityDpi
+        if (previewVirtualDisplay == null) {
+            previewVirtualDisplay = projection.createVirtualDisplay(
+                "LiveCast preview",
+                width,
+                height,
+                densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface,
+                null,
+                handler
+            )
+        } else {
+            previewVirtualDisplay?.resize(width, height, densityDpi)
+            previewVirtualDisplay?.setSurface(surface)
+        }
+        attachedPreviewSurface = surface
+    }
+
+    private fun startPreviewCapture(i: Intent) {
+        if (running) return
+        val data = i.getParcelableExtra<Intent>("data")
+            ?: throw IllegalArgumentException("Screen capture permission was not provided")
+        val channel = "live"
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(channel, "LiveCast", NotificationManager.IMPORTANCE_LOW)
+        )
+        val notification = Notification.Builder(this, channel)
+            .setContentTitle("Screen preview active")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(1, notification)
+        }
+        val projectionManager = getSystemService(MediaProjectionManager::class.java)
+        val projection = projectionManager.getMediaProjection(i.getIntExtra("code", 0), data)
+        val callback = object : MediaProjection.Callback() {
+            override fun onStop() {
+                stopPreviewCapture("Screen capture stopped")
+            }
+        }
+        projection.registerCallback(callback, handler)
+        projectionCallback = callback
+        previewProjection = projection
+        previewOnly = true
+        running = true
+        streamStatus = "Screen preview active"
+        broadcastStatus()
+    }
+
+    private fun stopPreviewCapture(status: String) {
+        previewOnly = false
+        previewVirtualDisplay?.release()
+        previewVirtualDisplay = null
+        attachedPreviewSurface = null
+        projectionCallback?.let { callback ->
+            previewProjection?.unregisterCallback(callback)
+        }
+        projectionCallback = null
+        val projection = previewProjection
+        previewProjection = null
+        projection?.stop()
+        running = false
+        streamStatus = status
+        broadcastStatus()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     private fun start(i: Intent) {
         if (running) return
         streamConnected = false
@@ -114,8 +224,16 @@ class StreamService : Service(), ConnectChecker {
         val n = Notification.Builder(this, ch)
             .setContentTitle(if (i.getStringExtra("mode") == "record") "Recording screen" else "Streaming live")
             .setSmallIcon(android.R.drawable.ic_media_play).build()
-        startForeground(1, n,
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                1,
+                n,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else {
+            startForeground(1, n)
+        }
 
         val w = if (landscape) 1280 else 720
         val h = if (landscape) 720 else 1280
@@ -206,7 +324,9 @@ class StreamService : Service(), ConnectChecker {
                     RecordController.Status.STOPPED -> {
                         recording = false
                         recordStatus = "Saved in Android/data/com.livecast/files/Movies: ${file.name}"
+                        persistRecording(file)
                     }
+
                     else -> Unit
                 }
                 broadcastStatus()
@@ -221,6 +341,13 @@ class StreamService : Service(), ConnectChecker {
         recording = true
         recordStatus = "Recording: ${file.name}"
         broadcastStatus()
+    }
+
+    private fun persistRecording(file: File) {
+        lastRecordingPath = file.absolutePath
+        getSharedPreferences("livecast", MODE_PRIVATE).edit()
+            .putString("last_recording_path", file.absolutePath)
+            .apply()
     }
 
     // Draws overlay (chat + scrolling ticker) on a half-res transparent bitmap ~8 fps
@@ -271,6 +398,10 @@ class StreamService : Service(), ConnectChecker {
     }
 
     private fun stop(errorStatus: String? = null) {
+        if (previewOnly) {
+            stopPreviewCapture(errorStatus ?: "Preview stopped")
+            return
+        }
         running = false
         streamRequested = false
         streamConnected = false
