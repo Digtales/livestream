@@ -36,10 +36,10 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.GeneralSecurityException
 import java.security.KeyStore
-import java.security.spec.GCMParameterSpec
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 class MainActivity : Activity() {
     private lateinit var url: EditText
