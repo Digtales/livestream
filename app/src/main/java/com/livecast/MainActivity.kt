@@ -53,6 +53,10 @@ class MainActivity : Activity() {
 
     private lateinit var url: EditText
     private lateinit var streamKey: EditText
+    private lateinit var facebookUrl: EditText
+    private lateinit var facebookStreamKey: EditText
+    private lateinit var youtubeDestination: CheckBox
+    private lateinit var facebookDestination: CheckBox
     private lateinit var ticker: EditText
     private lateinit var chatId: EditText
     private lateinit var token: EditText
@@ -94,6 +98,9 @@ class MainActivity : Activity() {
     private var previewHeight = 0
     private var cachedStreamKey: String? = null
     private var cachedEncryptedStreamKey: String? = null
+    private var cachedFacebookStreamKey: String? = null
+    private var cachedEncryptedFacebookStreamKey: String? = null
+    private var restoringSettings = false
     private val settingsPreferences by lazy { getSharedPreferences("livecast_settings", MODE_PRIVATE) }
 
     private val serviceConnection = object : ServiceConnection {
@@ -247,19 +254,52 @@ class MainActivity : Activity() {
             root.addView(this)
         }
 
-        root.addView(label("Destination"))
-        url = et("RTMP server URL (e.g. rtmp://a.rtmp.youtube.com/live2)")
+        root.addView(label("Streaming destinations (select one or both)"))
+        val destinationSelection = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        youtubeDestination = CheckBox(this).apply {
+            text = "YouTube"
+            setTextColor(Color.WHITE)
+            isChecked = true
+            setOnCheckedChangeListener { _, _ -> persistSettings() }
+        }
+        facebookDestination = CheckBox(this).apply {
+            text = "Facebook"
+            setTextColor(Color.WHITE)
+            setOnCheckedChangeListener { _, _ -> persistSettings() }
+        }
+        destinationSelection.addView(youtubeDestination)
+        destinationSelection.addView(facebookDestination)
+        root.addView(destinationSelection)
+
+        root.addView(label("YouTube RTMP server URL"))
+        url = et("rtmp://a.rtmp.youtube.com/live2")
+        root.addView(label("YouTube stream key"))
         streamKey = et("YouTube stream key (actual secret value)")
         streamKey.inputType = android.text.InputType.TYPE_CLASS_TEXT or
             android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
         root.addView(TextView(this).apply {
-            text = "In YouTube Studio > Live Control Room > Stream settings, copy the key value. A custom key name (for example, TradeLive) is only a label, not the key."
+            text = "Copy the key from YouTube Studio > Live Control Room > Stream settings."
+            setTextColor(Color.parseColor("#AAB3C2"))
+            textSize = 12f
+            setPadding(0, dp(4), 0, dp(8))
+        })
+
+        root.addView(label("Facebook RTMP server URL"))
+        facebookUrl = et("rtmps://live-api-s.facebook.com:443/rtmp")
+        root.addView(label("Facebook stream key"))
+        facebookStreamKey = et("Facebook Live stream key")
+        facebookStreamKey.inputType = android.text.InputType.TYPE_CLASS_TEXT or
+            android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        root.addView(TextView(this).apply {
+            text = "Enter the server URL and stream key shown in Facebook Live Producer. Both destinations use your network upload bandwidth."
             setTextColor(Color.parseColor("#AAB3C2"))
             textSize = 12f
             setPadding(0, dp(4), 0, dp(8))
         })
         connectBtn = Button(this).apply {
-            text = "CHECK SERVER"
+            text = "CHECK SELECTED SERVERS"
             setAllCaps(false)
             root.addView(this)
         }
@@ -350,7 +390,7 @@ class MainActivity : Activity() {
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
-        root.addView(label("Platform"))
+        root.addView(label("Live chat source"))
         platform = RadioGroup(this).apply {
             orientation = RadioGroup.HORIZONTAL
             listOf("YouTube", "Facebook", "RTMP only").forEachIndexed { i, text ->
@@ -456,7 +496,9 @@ class MainActivity : Activity() {
         root.addView(recordingStatus)
         btn.setOnClickListener {
             saveSettings()
-            if (StreamService.streamConnected || StreamService.streamStatus == "Connecting") {
+            if (StreamService.streamRequested ||
+                StreamService.streamStatus.contains("Connecting", ignoreCase = true)
+            ) {
                 startService(Intent(this, StreamService::class.java).setAction("STOP_STREAM"))
             } else {
                 showPage(false)
@@ -655,11 +697,31 @@ class MainActivity : Activity() {
     }
 
     private fun restoreSettings() {
+        restoringSettings = true
         val prefs = settingsPreferences
-        url.setText(prefs.getString("server_url", "rtmp://a.rtmp.youtube.com/live2"))
-        cachedEncryptedStreamKey = prefs.getString("stream_key", "")
+        url.setText(
+            prefs.getString(
+                "youtube_server_url",
+                prefs.getString("server_url", "rtmp://a.rtmp.youtube.com/live2")
+            )
+        )
+        cachedEncryptedStreamKey = prefs.getString(
+            "youtube_stream_key",
+            prefs.getString("stream_key", "")
+        )
         cachedStreamKey = decryptStreamKey(cachedEncryptedStreamKey.orEmpty())
         streamKey.setText(cachedStreamKey)
+        facebookUrl.setText(
+            prefs.getString("facebook_server_url", "rtmps://live-api-s.facebook.com:443/rtmp")
+        )
+        cachedEncryptedFacebookStreamKey = prefs.getString("facebook_stream_key", "")
+        cachedFacebookStreamKey = decryptStreamKey(
+            cachedEncryptedFacebookStreamKey.orEmpty(),
+            "facebook_stream_key"
+        )
+        facebookStreamKey.setText(cachedFacebookStreamKey)
+        youtubeDestination.isChecked = prefs.getBoolean("youtube_enabled", true)
+        facebookDestination.isChecked = prefs.getBoolean("facebook_enabled", false)
         ticker.setText(prefs.getString("ticker_text", ""))
         tickerPosition.check(prefs.getInt("ticker_position", 11))
         tickerFont.setSelection(prefs.getInt("ticker_font", 0).coerceIn(0, 3))
@@ -676,10 +738,11 @@ class MainActivity : Activity() {
         mic.isChecked = prefs.getBoolean("microphone", true)
         preview.isChecked = StreamService.previewEnabled
         updatePreviewAspectRatio()
+        restoringSettings = false
     }
 
     private fun bindSettingsPersistence() {
-        listOf(url, streamKey, ticker, chatId).forEach { field ->
+        listOf(url, streamKey, facebookUrl, facebookStreamKey, ticker, chatId).forEach { field ->
             field.addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
@@ -691,8 +754,13 @@ class MainActivity : Activity() {
     }
 
     private fun persistSettings() {
-        if (!::url.isInitialized ||
+        if (restoringSettings ||
+            !::url.isInitialized ||
             !::streamKey.isInitialized ||
+            !::facebookUrl.isInitialized ||
+            !::facebookStreamKey.isInitialized ||
+            !::youtubeDestination.isInitialized ||
+            !::facebookDestination.isInitialized ||
             !::ticker.isInitialized ||
             !::tickerPosition.isInitialized ||
             !::tickerFont.isInitialized ||
@@ -719,9 +787,32 @@ class MainActivity : Activity() {
         streamKey.error = null
         cachedStreamKey = currentStreamKey
         cachedEncryptedStreamKey = encryptedStreamKey
+        val currentFacebookStreamKey = facebookStreamKey.text.toString()
+        val encryptedFacebookStreamKey = if (currentFacebookStreamKey == cachedFacebookStreamKey &&
+            cachedEncryptedFacebookStreamKey != null
+        ) {
+            cachedEncryptedFacebookStreamKey.orEmpty()
+        } else {
+            try {
+                encryptStreamKey(currentFacebookStreamKey)
+            } catch (e: GeneralSecurityException) {
+                facebookStreamKey.error =
+                    "Unable to securely save stream key: ${e.message ?: "Keystore error"}"
+                return
+            }
+        }
+        facebookStreamKey.error = null
+        cachedFacebookStreamKey = currentFacebookStreamKey
+        cachedEncryptedFacebookStreamKey = encryptedFacebookStreamKey
         settingsPreferences.edit()
             .putString("server_url", url.text.toString())
             .putString("stream_key", encryptedStreamKey)
+            .putString("youtube_server_url", url.text.toString())
+            .putString("youtube_stream_key", encryptedStreamKey)
+            .putString("facebook_server_url", facebookUrl.text.toString())
+            .putString("facebook_stream_key", encryptedFacebookStreamKey)
+            .putBoolean("youtube_enabled", youtubeDestination.isChecked)
+            .putBoolean("facebook_enabled", facebookDestination.isChecked)
             .putString("ticker_text", ticker.text.toString())
             .putInt("ticker_position", tickerPosition.checkedRadioButtonId)
             .putInt("ticker_font", tickerFont.selectedItemPosition)
@@ -734,7 +825,7 @@ class MainActivity : Activity() {
             .apply()
     }
 
-    private fun decryptStreamKey(encoded: String): String {
+    private fun decryptStreamKey(encoded: String, preferenceKey: String = "stream_key"): String {
         if (encoded.isEmpty()) return ""
         return try {
             val encrypted = Base64.decode(encoded, Base64.NO_WRAP)
@@ -745,11 +836,11 @@ class MainActivity : Activity() {
             cipher.init(Cipher.DECRYPT_MODE, streamKeyEncryptionKey(), GCMParameterSpec(128, iv))
             String(cipher.doFinal(ciphertext), Charsets.UTF_8)
         } catch (e: IllegalArgumentException) {
-            clearSavedStreamKey()
+            clearSavedStreamKey(preferenceKey)
             Toast.makeText(this, "Saved stream key is invalid. Enter it again.", Toast.LENGTH_LONG).show()
             ""
         } catch (e: GeneralSecurityException) {
-            clearSavedStreamKey()
+            clearSavedStreamKey(preferenceKey)
             Toast.makeText(this, "Saved stream key could not be unlocked. Enter it again.", Toast.LENGTH_LONG).show()
             ""
         }
@@ -788,10 +879,17 @@ class MainActivity : Activity() {
         return generator.generateKey()
     }
 
-    private fun clearSavedStreamKey() {
-        settingsPreferences.edit().remove("stream_key").apply()
-        cachedStreamKey = ""
-        cachedEncryptedStreamKey = ""
+    private fun clearSavedStreamKey(preferenceKey: String) {
+        val editor = settingsPreferences.edit().remove(preferenceKey)
+        if (preferenceKey == "stream_key") editor.remove("youtube_stream_key")
+        editor.apply()
+        if (preferenceKey == "facebook_stream_key") {
+            cachedFacebookStreamKey = ""
+            cachedEncryptedFacebookStreamKey = ""
+        } else {
+            cachedStreamKey = ""
+            cachedEncryptedStreamKey = ""
+        }
     }
 
     private fun rounded(color: String) = GradientDrawable().apply {
@@ -879,53 +977,73 @@ class MainActivity : Activity() {
     }
 
     private fun validRtmpUrl(): Boolean {
-        val value = effectiveRtmpUrl()
-        val uri = Uri.parse(value)
-        val pathSegments = uri.pathSegments.filter { it.isNotBlank() }
-        if (!listOf("rtmp", "rtmps").any { it.equals(uri.scheme, ignoreCase = true) } ||
-            uri.host.isNullOrBlank() ||
-            pathSegments.size < 2
-        ) {
-            url.error = "Use an RTMP(S) server URL with app name and stream key"
+        val selected = mutableListOf<Pair<EditText, String>>()
+        if (youtubeDestination.isChecked) {
+            selected.add(url to effectiveRtmpUrl(url, streamKey))
+        }
+        if (facebookDestination.isChecked) {
+            selected.add(facebookUrl to effectiveRtmpUrl(facebookUrl, facebookStreamKey))
+        }
+        if (selected.isEmpty()) {
+            Toast.makeText(this, "Select YouTube, Facebook, or both as destinations.", Toast.LENGTH_LONG).show()
             return false
         }
-        url.error = null
-        return true
+        var allValid = true
+        selected.forEach { (field, value) ->
+            val uri = Uri.parse(value)
+            val pathSegments = uri.pathSegments.filter { it.isNotBlank() }
+            val valid = listOf("rtmp", "rtmps").any { it.equals(uri.scheme, ignoreCase = true) } &&
+                !uri.host.isNullOrBlank() &&
+                pathSegments.size >= 2
+            field.error = if (valid) null else "Enter a valid RTMP(S) server URL and stream key"
+            if (!valid) allValid = false
+        }
+        return allValid
     }
 
-    private fun effectiveRtmpUrl(): String {
-        val serverUrl = url.text.toString().trim().trimEnd('/')
-        val key = streamKey.text.toString().trim().trim('/')
+    private fun effectiveRtmpUrl(serverField: EditText, keyField: EditText): String {
+        val serverUrl = serverField.text.toString().trim().trimEnd('/')
+        val key = keyField.text.toString().trim().trim('/')
         return if (key.isEmpty()) serverUrl else "$serverUrl/$key"
     }
 
     private fun checkDestination() {
         if (!validRtmpUrl()) return
-        val uri = Uri.parse(effectiveRtmpUrl())
-        val port = if (uri.port > 0) uri.port else if (uri.scheme.equals("rtmps", ignoreCase = true)) 443 else 1935
-        val host = uri.host ?: return
+        val destinations = buildList {
+            if (youtubeDestination.isChecked) add("YouTube" to url)
+            if (facebookDestination.isChecked) add("Facebook" to facebookUrl)
+        }
         connectBtn.isEnabled = false
-        destinationStatus.text = "Checking $host:$port..."
+        destinationStatus.text = "Checking ${destinations.joinToString(" and ") { it.first }}..."
         destinationStatus.setTextColor(Color.YELLOW)
         Thread {
-            val result = try {
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress(host, port), 5000)
+            val results = destinations.map { (name, field) ->
+                val uri = Uri.parse(field.text.toString().trim())
+                val port = if (uri.port > 0) uri.port else if (
+                    uri.scheme.equals("rtmps", ignoreCase = true)
+                ) 443 else 1935
+                val host = uri.host
+                val message = if (host == null) {
+                    "invalid server URL"
+                } else {
+                    try {
+                        Socket().use { socket ->
+                            socket.connect(InetSocketAddress(host, port), 5000)
+                        }
+                        "TCP reachable"
+                    } catch (e: java.io.IOException) {
+                        "unreachable: ${e.message ?: "connection refused"}"
+                    }
                 }
-                "RTMP server reachable. Tap STREAM to start the live broadcast."
-            } catch (e: java.io.IOException) {
-                "Server check failed: ${e.message ?: "connection refused"}"
+                "$name: $message"
             }
+            val allReachable = results.all { it.endsWith("TCP reachable") }
             runOnUiThread {
                 connectBtn.isEnabled = true
-                destinationStatus.text = if (result.startsWith("RTMP server reachable")) {
-                    "TCP reachable only; tap STREAM to publish. This does not verify your stream key."
-                } else {
-                    result
-                }
-                val reachable = result.startsWith("RTMP server reachable")
-                destinationStatus.setTextColor(if (reachable) Color.GREEN else Color.RED)
-                setDot(destinationDot, if (reachable) Color.GREEN else Color.RED)
+                destinationStatus.text = results.joinToString(" | ") +
+                    if (allReachable) " | TCP check only; stream key is not verified." else ""
+                destinationStatus.setTextColor(if (allReachable) Color.GREEN else Color.RED)
+                setDot(destinationDot, if (allReachable) Color.GREEN else Color.RED)
             }
         }.start()
     }
@@ -937,7 +1055,16 @@ class MainActivity : Activity() {
                 2 -> "fb"
                 else -> "rtmp"
             }
-            rtmpUrl = this@MainActivity.effectiveRtmpUrl()
+            youtubeRtmpUrl = this@MainActivity.effectiveRtmpUrl(
+                this@MainActivity.url,
+                this@MainActivity.streamKey
+            )
+            facebookRtmpUrl = this@MainActivity.effectiveRtmpUrl(
+                this@MainActivity.facebookUrl,
+                this@MainActivity.facebookStreamKey
+            )
+            youtubeSelected = this@MainActivity.youtubeDestination.isChecked
+            facebookSelected = this@MainActivity.facebookDestination.isChecked
             tickerText = this@MainActivity.ticker.text.toString()
             chatSource = when (this@MainActivity.platform.checkedRadioButtonId) {
                 1 -> "yt"
@@ -1036,7 +1163,8 @@ class MainActivity : Activity() {
             streamDot,
             when {
                 StreamService.streamConnected -> Color.GREEN
-                StreamService.streamStatus == "Connecting" ||
+                StreamService.streamRequested ||
+                    StreamService.streamStatus.contains("Connecting", ignoreCase = true) ||
                     StreamService.streamStatus.startsWith("Waiting") ||
                     StreamService.streamStatus.startsWith("Checking") ||
                     StreamService.streamStatus.startsWith("Allow screen") ||
@@ -1046,8 +1174,8 @@ class MainActivity : Activity() {
         )
         streamStatus.text = StreamService.streamStatus
         btn.text = when {
-            StreamService.streamConnected -> "STOP STREAM"
-            StreamService.streamStatus == "Connecting" -> "CANCEL STREAM"
+            StreamService.streamRequested -> "STOP STREAM"
+            StreamService.streamStatus.contains("Connecting", ignoreCase = true) -> "CANCEL STREAM"
             StreamService.streamStatus.startsWith("Waiting") -> "PLEASE WAIT..."
             else -> "GO LIVE"
         }

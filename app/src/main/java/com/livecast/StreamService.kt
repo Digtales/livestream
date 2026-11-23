@@ -15,13 +15,14 @@ import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.gl.render.filters.`object`.ImageObjectFilterRender
 import com.pedro.encoder.utils.gl.TranslateTo
 import com.pedro.library.base.recording.RecordController
-import com.pedro.library.rtmp.RtmpDisplay
+import com.pedro.library.multiple.MultiDisplay
+import com.pedro.library.multiple.MultiType
 import com.pedro.library.view.GlStreamInterface
 import java.io.File
 import kotlin.math.max
 import kotlin.math.min
 
-class StreamService : Service(), ConnectChecker {
+class StreamService : Service() {
     inner class LocalBinder : Binder() {
         fun getService() = this@StreamService
     }
@@ -42,9 +43,16 @@ class StreamService : Service(), ConnectChecker {
         var lastRecordingPath = ""
         var chatConnected = false
         var streamStatus = "Disconnected"
+        var youtubeStreamStatus = "Not selected"
+        var facebookStreamStatus = "Not selected"
+        var youtubeConnected = false
+        var facebookConnected = false
+        var youtubeSelected = true
+        var facebookSelected = false
         var outputAspectRatio = 9f / 16f
         var platform = ""
-        var rtmpUrl = ""; var tickerText = ""; var chatSource = ""; var chatTarget = ""; var chatToken = ""
+        var youtubeRtmpUrl = ""; var facebookRtmpUrl = ""
+        var tickerText = ""; var chatSource = ""; var chatTarget = ""; var chatToken = ""
         var landscape = false; var micOn = true
         var tickerPosition = "bottom"
         var tickerTextSize = 24
@@ -52,7 +60,7 @@ class StreamService : Service(), ConnectChecker {
         var tickerColor = Color.WHITE
     }
 
-    private var display: RtmpDisplay? = null
+    private var display: MultiDisplay? = null
     private var filter: ImageObjectFilterRender? = null
     private val handler = Handler(Looper.getMainLooper())
     private val chat = ArrayList<String>()
@@ -68,10 +76,14 @@ class StreamService : Service(), ConnectChecker {
     @Volatile private var recordingStartedAtMs = 0L
     @Volatile private var recordStopRequested = false
     @Volatile private var stopServiceAfterRecording = false
+    private var youtubeStreamAttempted = false
+    private var facebookStreamAttempted = false
     private var stopServiceStatus: String? = null
     private val binder = LocalBinder()
     private val minimumRecordDurationMs = 1_000L
     private val recordStartTimeoutMs = 10_000L
+    private val youtubeConnectChecker = destinationChecker("YouTube")
+    private val facebookConnectChecker = destinationChecker("Facebook")
 
     override fun onBind(i: Intent?) = binder
 
@@ -284,6 +296,12 @@ class StreamService : Service(), ConnectChecker {
         if (running) return
         audioPrepared = false
         previewReady = false
+        streamRequested = false
+        streamConnected = false
+        youtubeConnected = false
+        facebookConnected = false
+        youtubeStreamStatus = if (youtubeSelected) "Disconnected" else "Not selected"
+        facebookStreamStatus = if (facebookSelected) "Disconnected" else "Not selected"
         attachedPreviewSurface = null
         requestedPreviewSurface = null
         previewAttachRunnable?.let(handler::removeCallbacks)
@@ -338,7 +356,14 @@ class StreamService : Service(), ConnectChecker {
         val outputWidth = if (landscape) encoderWidth else encoderHeight
         val outputHeight = if (landscape) encoderHeight else encoderWidth
         outputAspectRatio = outputWidth.toFloat() / outputHeight
-        val d = RtmpDisplay(this, true, this)
+        val d = MultiDisplay(
+            this,
+            true,
+            arrayOf(youtubeConnectChecker, facebookConnectChecker),
+            null,
+            null,
+            null
+        )
         d.setIntentResult(
             i.getIntExtra("code", 0),
             i.getParcelableExtra("data")
@@ -390,22 +415,124 @@ class StreamService : Service(), ConnectChecker {
 
     private fun startStream() {
         val d = display ?: return
-        if (d.isStreaming) return
+        if (streamRequested) return
+        val destinations = mutableListOf<Triple<String, Int, String>>()
+        if (youtubeSelected) destinations.add(Triple("YouTube", 0, youtubeRtmpUrl))
+        if (facebookSelected) destinations.add(Triple("Facebook", 1, facebookRtmpUrl))
+        if (destinations.isEmpty()) {
+            streamRequested = false
+            streamConnected = false
+            streamStatus = "Select YouTube, Facebook, or both before streaming."
+            broadcastStatus()
+            return
+        }
         streamRequested = true
-        streamStatus = "Connecting"
         streamConnected = false
-        broadcastStatus()
-        d.startStream(rtmpUrl)
+        youtubeConnected = false
+        facebookConnected = false
+        youtubeStreamAttempted = youtubeSelected
+        facebookStreamAttempted = facebookSelected
+        youtubeStreamStatus = if (youtubeSelected) "Connecting" else "Not selected"
+        facebookStreamStatus = if (facebookSelected) "Connecting" else "Not selected"
+        updateCombinedStreamStatus()
+        destinations.forEach { (name, index, endpoint) ->
+            try {
+                d.startStream(MultiType.RTMP, index, endpoint)
+            } catch (e: RuntimeException) {
+                updateDestinationStatus(name, "Failed: ${e.message ?: "could not connect"}", false)
+            }
+        }
     }
 
     private fun stopStream() {
         val d = display
         streamRequested = false
-        if (d?.isStreaming == true) d.stopStream()
         streamConnected = false
-        streamStatus = "Disconnected"
+        youtubeConnected = false
+        facebookConnected = false
+        youtubeStreamStatus = if (youtubeSelected) "Disconnected" else "Not selected"
+        facebookStreamStatus = if (facebookSelected) "Disconnected" else "Not selected"
+        if (d?.isRecording == true) {
+            if (d != null) stopDestinationStreams(d)
+            updateCombinedStreamStatus()
+        } else {
+            stop()
+        }
+    }
+
+    private fun stopDestinationStreams(d: MultiDisplay) {
+        if (youtubeStreamAttempted) d.stopStream(MultiType.RTMP, 0)
+        if (facebookStreamAttempted) d.stopStream(MultiType.RTMP, 1)
+        youtubeStreamAttempted = false
+        facebookStreamAttempted = false
+    }
+
+    private fun updateCombinedStreamStatus() {
+        streamConnected = (youtubeSelected && youtubeConnected) ||
+            (facebookSelected && facebookConnected)
+        val statuses = mutableListOf<String>()
+        if (youtubeSelected) statuses.add("YouTube: $youtubeStreamStatus")
+        if (facebookSelected) statuses.add("Facebook: $facebookStreamStatus")
+        streamStatus = statuses.joinToString(" | ").ifEmpty { "No stream destination selected" }
         broadcastStatus()
-        if (d?.isRecording != true) stop()
+    }
+
+    private fun updateDestinationStatus(name: String, status: String, connected: Boolean) {
+        if (name == "YouTube") {
+            youtubeStreamStatus = status
+            youtubeConnected = connected
+        } else {
+            facebookStreamStatus = status
+            facebookConnected = connected
+        }
+        updateCombinedStreamStatus()
+
+        val hasPendingConnection = (youtubeSelected && youtubeStreamStatus == "Connecting") ||
+            (facebookSelected && facebookStreamStatus == "Connecting")
+        if (streamRequested && !streamConnected && !hasPendingConnection) {
+            streamRequested = false
+            val failureStatus = streamStatus
+            val activeDisplay = display
+            if (activeDisplay != null) stopDestinationStreams(activeDisplay)
+            if (activeDisplay?.isRecording == true) {
+                streamStatus = failureStatus
+                broadcastStatus()
+            } else {
+                stop(failureStatus)
+            }
+        }
+    }
+
+    private fun destinationChecker(name: String) = object : ConnectChecker {
+        override fun onConnectionStarted(url: String) {
+            if (streamRequested) updateDestinationStatus(name, "Connecting", false)
+        }
+
+        override fun onConnectionSuccess() {
+            if (streamRequested) updateDestinationStatus(name, "Connected", true)
+        }
+
+        override fun onConnectionFailed(reason: String) {
+            if (!streamRequested) return
+            val status = if (reason.contains("EOF", ignoreCase = true)) {
+                "Failed: RTMP handshake closed; check server URL and stream key"
+            } else {
+                "Failed: $reason"
+            }
+            updateDestinationStatus(name, status, false)
+        }
+
+        override fun onNewBitrate(bitrate: Long) {}
+
+        override fun onDisconnect() {
+            if (streamRequested) updateDestinationStatus(name, "Disconnected", false)
+        }
+
+        override fun onAuthError() {
+            if (streamRequested) updateDestinationStatus(name, "Authentication failed", false)
+        }
+
+        override fun onAuthSuccess() {}
     }
 
     private fun toggleRecord() {
@@ -477,7 +604,7 @@ class StreamService : Service(), ConnectChecker {
             override fun onError(e: Exception) {
                 recording = d.isRecording
                 recordStatus = "Recording failed: ${e.message ?: "write error"}"
-                if (!d.isStreaming) stopServiceAfterRecording = true
+                if (!streamRequested) stopServiceAfterRecording = true
                 recordStopRequested = true
                 finishRecordingWhenReady(d)
                 broadcastStatus()
@@ -487,17 +614,17 @@ class StreamService : Service(), ConnectChecker {
             if (display === d && d.isRecording && recordingStartedAtMs == 0L) {
                 recordStatus = "Recording failed: no video frames arrived from screen capture."
                 recordStopRequested = true
-                if (!d.isStreaming) stopServiceAfterRecording = true
+                if (!streamRequested) stopServiceAfterRecording = true
                 broadcastStatus()
                 finishRecordingWhenReady(d)
             }
         }, recordStartTimeoutMs)
     }
 
-    private fun requestStopRecording(d: RtmpDisplay) {
+    private fun requestStopRecording(d: MultiDisplay) {
         if (recordStopRequested) return
         recordStopRequested = true
-        if (!d.isStreaming) stopServiceAfterRecording = true
+        if (!streamRequested) stopServiceAfterRecording = true
         if (!recordStatus.startsWith("Recording failed:")) {
             recordStatus = "Finalizing recording..."
         }
@@ -505,7 +632,7 @@ class StreamService : Service(), ConnectChecker {
         finishRecordingWhenReady(d)
     }
 
-    private fun finishRecordingWhenReady(d: RtmpDisplay) {
+    private fun finishRecordingWhenReady(d: MultiDisplay) {
         if (display !== d || !d.isRecording) return
         val now = SystemClock.elapsedRealtime()
         val startedAt = recordingStartedAtMs
@@ -622,7 +749,13 @@ class StreamService : Service(), ConnectChecker {
             stopServiceStatus = errorStatus
             streamRequested = false
             streamConnected = false
-            if (activeDisplay.isStreaming) activeDisplay.stopStream()
+            if (errorStatus == null) {
+                youtubeConnected = false
+                facebookConnected = false
+                youtubeStreamStatus = if (youtubeSelected) "Disconnected" else "Not selected"
+                facebookStreamStatus = if (facebookSelected) "Disconnected" else "Not selected"
+            }
+            stopDestinationStreams(activeDisplay)
             requestStopRecording(activeDisplay)
             streamStatus = errorStatus ?: "Finalizing recording..."
             broadcastStatus()
@@ -631,6 +764,12 @@ class StreamService : Service(), ConnectChecker {
         running = false
         streamRequested = false
         streamConnected = false
+        if (errorStatus == null) {
+            youtubeConnected = false
+            facebookConnected = false
+            youtubeStreamStatus = if (youtubeSelected) "Disconnected" else "Not selected"
+            facebookStreamStatus = if (facebookSelected) "Disconnected" else "Not selected"
+        }
         recording = false
         audioPrepared = false
         previewReady = false
@@ -643,9 +782,11 @@ class StreamService : Service(), ConnectChecker {
         broadcastStatus()
         handler.removeCallbacksAndMessages(null)
         poller?.stopPolling()
-        display?.apply {
-            if (isRecording) stopRecord()
-            if (isStreaming) stopStream()
+        display?.let { activeDisplay ->
+            stopDestinationStreams(activeDisplay)
+            activeDisplay.apply {
+                if (isRecording) stopRecord()
+            }
         }
         display = null
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
@@ -655,40 +796,4 @@ class StreamService : Service(), ConnectChecker {
         sendBroadcast(Intent(STATUS_ACTION))
     }
 
-    override fun onConnectionStarted(url: String) {
-        if (!streamRequested) return
-        streamConnected = false
-        streamStatus = "Connecting"
-        broadcastStatus()
-    }
-    override fun onConnectionSuccess() {
-        if (!streamRequested) return
-        streamConnected = true
-        streamStatus = if (platform == "yt") "YouTube Live connected" else "Live connected"
-        broadcastStatus()
-    }
-    override fun onConnectionFailed(reason: String) {
-        if (!streamRequested) return
-        streamRequested = false
-        streamConnected = false
-        streamStatus = if (reason.contains("EOF", ignoreCase = true)) {
-            "RTMP handshake closed. Check server/app/key URL and RTMP 1935 vs RTMPS 443."
-        } else {
-            "Connection failed: $reason"
-        }
-        val errorStatus = streamStatus
-        val d = display
-        if (d?.isStreaming == true) d.stopStream()
-        broadcastStatus()
-        if (d?.isRecording != true) stop(errorStatus)
-    }
-    override fun onNewBitrate(bitrate: Long) {}
-    override fun onDisconnect() {
-        if (!running || !streamRequested) return
-        streamConnected = false
-        streamStatus = "Disconnected"
-        broadcastStatus()
-    }
-    override fun onAuthError() {}
-    override fun onAuthSuccess() {}
 }
